@@ -10,6 +10,7 @@ const {
   verifyWebhookSignature,
   simulateAsyncCallback,
 } = require('../utils/mockPaymentProvider');
+const { checkoutLimiter } = require('../security');
 
 const router = express.Router();
 const RESALE_FEE_RATE = 0.10;
@@ -96,7 +97,7 @@ router.post('/:id/cancel', requireAuth, async (req, res) => {
   res.json({ message: 'Listing cancelled' });
 });
 
-router.post('/:id/buy', requireAuth, async (req, res) => {
+router.post('/:id/buy', requireAuth, checkoutLimiter, async (req, res) => {
   const listing = await db.one('SELECT * FROM resale_listings WHERE id = $1', [req.params.id]);
   if (!listing || listing.status !== 'active') {
     return res.status(404).json({ error: 'Listing not found or no longer available' });

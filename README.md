@@ -1,5 +1,13 @@
 # AfroTickets API — Cloud Run + Cloud SQL variant
 
+**Current version: 1.5.0** — see `CHANGELOG.md` for what changed and when.
+After any deploy, confirm what's actually live with:
+```bash
+curl https://YOUR-SERVICE-URL/version
+```
+This is the fastest way to tell whether a redeploy actually picked up your
+latest changes, without guessing from Cloud Run's build logs.
+
 A working backend for AfroTickets: real auth, a real Postgres database, real
 ticket inventory with reservation holds, an async payment flow with
 signed/idempotent webhooks, cryptographically signed QR tickets, check-in
@@ -206,6 +214,46 @@ curl -s -X POST localhost:8080/api/organizer/events/:id/seats \
 rows are individually bookable subdivisions of the same inventory the plain
 quantity counters already track, not a separate pool.
 
+## Real M-Pesa checkout (Safaricom Daraja)
+
+By default, `paymentMethod:"mpesa"` uses the mock provider like every other
+payment method — no M-Pesa credentials required to try the rest of the app.
+To make it genuinely send an STK Push to a real phone, set six env vars:
+
+```
+MPESA_ENV=sandbox
+MPESA_CONSUMER_KEY=...        # from your Daraja app's SANDBOX credentials
+MPESA_CONSUMER_SECRET=...     # never your production ones for local testing
+MPESA_SHORTCODE=174379        # 174379 is Safaricom's shared sandbox shortcode
+MPESA_PASSKEY=...             # from the Daraja portal's STK Push sandbox page
+MPESA_CALLBACK_URL=https://your-deployed-url/api/orders/webhook/mpesa
+MPESA_CALLBACK_SECRET=$(openssl rand -hex 24)
+```
+
+**This only works once deployed** — Safaricom needs a real public URL to send
+the callback to, so `localhost` won't work even in sandbox mode.
+
+```bash
+curl -X POST https://your-deployed-url/api/orders \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"eventId":1,"items":[{"ticketTypeId":1,"quantity":1}],"paymentMethod":"mpesa","phone":"254712345678"}'
+```
+
+If everything's configured correctly, this sends a real STK Push to that
+phone (use a Safaricom sandbox test number, e.g. `254708374149`, with the
+sandbox app) and returns immediately with a message to check the phone — the
+order only becomes `paid` once Safaricom calls back your webhook with the
+customer's PIN confirmation.
+
+**Response codes worth knowing:**
+- `502` — the STK Push request itself failed (bad phone format, wrong
+  credentials, Safaricom unreachable) — no order was created, nothing to clean up
+- `400` with "phone is required" — you forgot the `phone` field
+- Order stuck on `pending_payment` — the customer hasn't responded to the
+  prompt yet, or the callback hasn't arrived; it expires via the normal
+  10-minute reservation window either way
+
 ## Try the resale flow
 
 ```bash
@@ -224,6 +272,50 @@ curl -s -X POST localhost:8080/api/resale/1/buy \
 # ~2 seconds later: the seller's original ticket is `invalidated` and the
 # buyer's GET /api/tickets/mine shows a brand-new, validly signed ticket.
 ```
+
+## Security hardening
+
+Since this API is meant to run reachable from the open internet (it does, on
+Cloud Run with `--allow-unauthenticated`), a few things are in place beyond
+just role-checked routes:
+
+- **Helmet** sets standard security headers (`X-Frame-Options`,
+  `X-Content-Type-Options`, HSTS, etc.) on every response.
+- **Rate limiting**, sized per endpoint sensitivity:
+  - General API traffic: 300 requests / 15 min per IP — a backstop, not
+    meant to bother a real user.
+  - `POST /api/auth/register` and `POST /api/auth/login` share a **10
+    requests / 15 min per IP** budget — tight enough to make credential
+    stuffing and brute-force login impractical.
+  - `POST /api/orders` and `POST /api/resale/:id/buy` (the actual
+    payment-initiating endpoints): **20 requests / 15 min per IP** — bounds
+    scripted inventory-holding/card-testing abuse without limiting a real
+    customer buying multiple ticket types.
+  - Payment **webhooks are deliberately exempt** from the checkout limiter —
+    they are server-to-server calls from your payment provider (potentially
+    many customers' webhooks arriving from one provider IP) and are already
+    authenticated by their HMAC signature, so rate-limiting them by IP would
+    risk throttling legitimate payment confirmations, not abuse.
+- **Input validation** on registration: proper email format, and passwords
+  must be at least 8 characters — rejected before they ever reach the
+  database or password hashing.
+- **Request body size capped at 100kb** on both the JSON parser and the raw
+  webhook parser, so a client cannot send an oversized payload to exhaust
+  memory.
+- `app.set("trust proxy", 1)` — both Cloud Run and Railway sit this app behind their
+  own reverse proxy; without this, every request appears to come from
+  the same internal proxy IP, which would make the IP-based rate limiters
+  above either share one bucket across every real visitor, or misidentify
+  who to block.
+
+**What is deliberately still open**, and why it is a reasonable line to draw
+for this stage: CORS remains wide open (`cors()` with defaults) because the
+frontend prototype is a static HTML file that may be opened via `file://`
+or served from any arbitrary local port — restricting `Access-Control-Allow-Origin`
+to a fixed list would break that flexibility for no real security gain here,
+since the API's actual protection is auth + role checks on every sensitive
+route, not origin-checking. If you deploy the frontend to a fixed domain,
+tightening CORS to that origin is a reasonable next step.
 
 ## Scope note on fraud detection
 

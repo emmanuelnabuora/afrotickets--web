@@ -197,7 +197,16 @@ CREATE TABLE IF NOT EXISTS notifications (
   type TEXT NOT NULL,
   channel TEXT NOT NULL,
   payload TEXT NOT NULL,
-  sent_at TIMESTAMPTZ DEFAULT now()
+  sent_at TIMESTAMPTZ DEFAULT now(),
+  read_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS saved_events (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  event_id INTEGER NOT NULL REFERENCES events(id),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(user_id, event_id)
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -221,6 +230,13 @@ CREATE TABLE IF NOT EXISTS fraud_signals (
   created_at TIMESTAMPTZ DEFAULT now()
 );
   `);
+
+  // CREATE TABLE IF NOT EXISTS is a no-op against a table that already exists
+  // from a prior deploy — it does NOT retroactively add new columns. Anything
+  // added to an existing table after the first deploy needs its own explicit,
+  // idempotent ALTER here so upgrading a live database is always safe to
+  // just run again on every boot.
+  await pool.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;`);
 }
 
 module.exports = { pool, query, one, withTransaction, migrate };

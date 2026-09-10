@@ -3,10 +3,11 @@ const express = require('express');
 const db = require('../db');
 const { hashPassword, verifyPassword, issueSessionToken, requireAuth } = require('../auth');
 const { audit } = require('../utils/audit');
+const { validateRegistration } = require('../security');
 
 const router = express.Router();
 
-router.post('/register', async (req, res) => {
+router.post('/register', validateRegistration, async (req, res) => {
   const { name, email, password, role } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'name, email, and password are required' });

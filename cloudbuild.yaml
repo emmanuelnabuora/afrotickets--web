@@ -1,0 +1,36 @@
+# cloudbuild.yaml
+# Runs automatically on every push (once the trigger below is set up).
+# Builds the Docker image, pushes it to Artifact Registry, and deploys the
+# new image to Cloud Run — the same three steps `gcloud run deploy --source .`
+# does for you manually, just automated.
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/afrotickets-api:$SHORT_SHA'
+      - '.'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/afrotickets-api:$SHORT_SHA'
+
+  - name: 'gcr.io/google-cloud-sdk/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'afrotickets-api'
+      - '--image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/afrotickets-api:$SHORT_SHA'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+      - '--add-cloudsql-instances=$PROJECT_ID:us-central1:afrotickets-db'
+      - '--update-secrets=DATABASE_URL=database-url:latest,JWT_SECRET=jwt-secret:latest,TICKET_SECRET=ticket-secret:latest,PAYMENT_WEBHOOK_SECRET=webhook-secret:latest,MANIFEST_SECRET=manifest-secret:latest'
+
+images:
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/afrotickets-api:$SHORT_SHA'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
