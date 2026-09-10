@@ -1,0 +1,24 @@
+{
+  "name": "afrotickets-backend",
+  "version": "1.0.0",
+  "description": "AfroTickets backend (Cloud Run + Cloud SQL variant) — auth, ticket inventory, checkout, payments, QR tickets, check-in, admin, resale.",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js",
+    "seed": "node seed.js",
+    "test": "node --test test/"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.23.0",
+    "qrcode": "^1.5.4"
+  }
+}
