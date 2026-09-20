@@ -4,13 +4,17 @@ const db = require('../db');
 const { requireAuth, requireRole } = require('../auth');
 const { audit } = require('../utils/audit');
 const { notify } = require('../utils/notify');
+const pii = require('../utils/piiCrypto');
 
 const router = express.Router();
 router.use(requireAuth, requireRole('platform_admin'));
 
 router.get('/organizers/pending', async (req, res) => {
   const rows = await db.query(`SELECT * FROM organizers WHERE verification_status = 'pending'`);
-  res.json({ organizers: rows });
+  // settlement_account is stored encrypted (utils/piiCrypto.js) — a platform
+  // admin reviewing onboarding is the one legitimate place to decrypt it.
+  const organizers = rows.map((o) => ({ ...o, settlement_account: pii.decrypt(o.settlement_account) }));
+  res.json({ organizers });
 });
 
 router.post('/organizers/:id/approve', async (req, res) => {

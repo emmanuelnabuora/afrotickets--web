@@ -6,6 +6,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const db = require('./db');
 const { generalLimiter, authLimiter } = require('./security');
+const { startRetentionSweep } = require('./utils/dataRetention');
 
 const authRoutes = require('./routes/auth');
 const eventRoutes = require('./routes/events');
@@ -99,6 +100,7 @@ async function start() {
   // Idempotent — safe to run on every boot. Cloud Run can start multiple
   // instances concurrently; CREATE TABLE IF NOT EXISTS makes that a no-op race.
   await db.migrate();
+  startRetentionSweep();
   app.listen(PORT, () => {
     console.log(`AfroTickets API listening on port ${PORT}`);
   });

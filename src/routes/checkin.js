@@ -5,6 +5,7 @@ const db = require('../db');
 const { requireAuth, requireRole } = require('../auth');
 const { verifyTicketToken } = require('../utils/qrTicket');
 const { audit } = require('../utils/audit');
+const { checkinLimiter } = require('../security');
 
 const router = express.Router();
 const MANIFEST_SECRET = process.env.MANIFEST_SECRET || 'dev-manifest-secret-change-me';
@@ -24,7 +25,7 @@ async function checkInByJti(jti, scannedAt, actorUserId) {
   return { result: 'success', jti, ticketId: ticket.id, checkedInAt: ts };
 }
 
-router.post('/scan', requireAuth, requireRole('organizer_owner', 'checkin_staff', 'platform_admin'), async (req, res) => {
+router.post('/scan', requireAuth, requireRole('organizer_owner', 'checkin_staff', 'platform_admin'), checkinLimiter, async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'token is required' });
   let decoded;
@@ -47,7 +48,7 @@ router.get('/manifest/:eventId', requireAuth, requireRole('organizer_owner', 'ch
   res.json({ eventId: Number(req.params.eventId), generatedAt, entries, signature });
 });
 
-router.post('/sync', requireAuth, requireRole('organizer_owner', 'checkin_staff', 'platform_admin'), async (req, res) => {
+router.post('/sync', requireAuth, requireRole('organizer_owner', 'checkin_staff', 'platform_admin'), checkinLimiter, async (req, res) => {
   const { scans } = req.body;
   if (!Array.isArray(scans)) return res.status(400).json({ error: 'scans array is required' });
   const results = [];

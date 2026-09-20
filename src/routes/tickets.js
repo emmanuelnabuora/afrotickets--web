@@ -5,6 +5,7 @@ const { requireAuth } = require('../auth');
 const { audit } = require('../utils/audit');
 const { notify } = require('../utils/notify');
 const { ticketQrDataUrl, signTicketToken } = require('../utils/qrTicket');
+const { transferLimiter } = require('../security');
 
 const router = express.Router();
 
@@ -40,7 +41,7 @@ router.get('/mine', requireAuth, async (req, res) => {
   res.json({ tickets });
 });
 
-router.post('/:id/transfer', requireAuth, async (req, res) => {
+router.post('/:id/transfer', requireAuth, transferLimiter, async (req, res) => {
   const { toEmail } = req.body;
   if (!toEmail) return res.status(400).json({ error: 'toEmail is required' });
 

@@ -13,6 +13,7 @@ const {
   simulateAsyncCallback,
 } = require('../utils/mockPaymentProvider');
 const mpesa = require('../utils/mpesaProvider');
+const pii = require('../utils/piiCrypto');
 const stripeProvider = require('../utils/stripeProvider');
 
 const router = express.Router();
@@ -151,7 +152,7 @@ router.post('/', requireAuth, checkoutLimiter, async (req, res) => {
 
     // Opportunistically capture the customer's phone number for future SMS/
     // WhatsApp notifications — never overwrite one they've already set.
-    db.query('UPDATE users SET phone = $1 WHERE id = $2 AND phone IS NULL', [phone, req.user.sub]).catch(() => {});
+    db.query('UPDATE users SET phone = $1 WHERE id = $2 AND phone IS NULL', [pii.encrypt(phone), req.user.sub]).catch(() => {});
 
     let stk;
     try {

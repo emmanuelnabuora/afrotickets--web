@@ -3,7 +3,7 @@
 // open internet (which it is, on Cloud Run with --allow-unauthenticated):
 // rate limits sized per endpoint sensitivity, and a few input-shape checks
 // that cost nothing and close off cheap abuse.
-const rateLimit = require('express-rate-limit');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 
 // General API traffic — generous, just a backstop against runaway clients
 // or basic scraping, not meant to bother a real user.
@@ -51,6 +51,32 @@ const afroguideLimiter = rateLimit({
   message: { error: 'Too many AfroGuide searches — please wait a few minutes and try again.' },
 });
 
+// Ticket transfer: bounds a compromised or scripted account from mass-
+// transferring tickets out before it's noticed. Keyed by user id (these
+// routes require auth) rather than IP, so one person's transfers never
+// throttle anyone else sharing their network.
+const transferLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.user?.sub ? `u:${req.user.sub}` : ipKeyGenerator(req.ip)),
+  message: { error: 'Too many transfer attempts — please wait a few minutes and try again.' },
+});
+
+// Check-in: real door staff scan in rapid bursts, so this is sized
+// generously per staff member (keyed by user id, same reasoning as above) —
+// it exists to bound a compromised scanner or scripted client hammering the
+// endpoint fishing for valid ticket codes, not to slow down a real line.
+const checkinLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => (req.user?.sub ? `u:${req.user.sub}` : ipKeyGenerator(req.ip)),
+  message: { error: 'Too many check-in requests — please slow down.' },
+});
+
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function validateRegistration(req, res, next) {
@@ -67,4 +93,74 @@ function validateRegistration(req, res, next) {
   next();
 }
 
-module.exports = { generalLimiter, authLimiter, checkoutLimiter, afroguideLimiter, validateRegistration };
+// Event creation: closes off garbage/oversized input reaching the DB or
+// getting rendered back to a browser later (an unbounded description, a
+// starts_at that isn't really a date, a currency that isn't a real code).
+const CATEGORY_RE = /^[a-zA-Z0-9 &/'-]{1,60}$/;
+
+function validateEventCreation(req, res, next) {
+  const { name, category, description, venue, city, country, startsAt, currency } = req.body;
+  if (typeof name !== 'string' || name.trim().length < 1 || name.length > 200) {
+    return res.status(400).json({ error: 'name must be 1-200 characters' });
+  }
+  if (typeof category !== 'string' || !CATEGORY_RE.test(category)) {
+    return res.status(400).json({ error: "category must be 1-60 characters (letters, numbers, spaces, &/-')" });
+  }
+  if (description !== undefined && description !== null && (typeof description !== 'string' || description.length > 5000)) {
+    return res.status(400).json({ error: 'description must be at most 5000 characters' });
+  }
+  for (const [field, value] of [['venue', venue], ['city', city], ['country', country]]) {
+    if (value !== undefined && value !== null && (typeof value !== 'string' || value.length > 200)) {
+      return res.status(400).json({ error: `${field} must be at most 200 characters` });
+    }
+  }
+  const startsAtDate = new Date(startsAt);
+  if (typeof startsAt !== 'string' || Number.isNaN(startsAtDate.getTime())) {
+    return res.status(400).json({ error: 'startsAt must be a valid date/time' });
+  }
+  if (startsAtDate.getTime() < Date.now()) {
+    return res.status(400).json({ error: 'startsAt must be in the future' });
+  }
+  if (currency !== undefined && currency !== null && (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency))) {
+    return res.status(400).json({ error: 'currency must be a 3-letter ISO code (e.g. USD, KES)' });
+  }
+  next();
+}
+
+// Ticket types are submitted inline with event creation (req.body.ticketTypes)
+// rather than through their own endpoint — validated here so a bad price or
+// quantity is rejected before an event row (and its dependent ticket_types
+// rows) is ever created.
+function validateTicketTypeCreation(req, res, next) {
+  const { ticketTypes } = req.body;
+  if (!Array.isArray(ticketTypes) || ticketTypes.length === 0) {
+    return res.status(400).json({ error: 'At least one ticket type is required' });
+  }
+  if (ticketTypes.length > 50) {
+    return res.status(400).json({ error: 'A single event cannot have more than 50 ticket types' });
+  }
+  for (const [i, tt] of ticketTypes.entries()) {
+    if (!tt || typeof tt.name !== 'string' || tt.name.trim().length < 1 || tt.name.length > 100) {
+      return res.status(400).json({ error: `ticketTypes[${i}].name must be 1-100 characters` });
+    }
+    if (typeof tt.price !== 'number' || !Number.isFinite(tt.price) || tt.price < 0 || tt.price > 1000000) {
+      return res.status(400).json({ error: `ticketTypes[${i}].price must be a number between 0 and 1,000,000` });
+    }
+    if (!Number.isInteger(tt.quantity) || tt.quantity < 1 || tt.quantity > 1000000) {
+      return res.status(400).json({ error: `ticketTypes[${i}].quantity must be a whole number between 1 and 1,000,000` });
+    }
+  }
+  next();
+}
+
+module.exports = {
+  generalLimiter,
+  authLimiter,
+  checkoutLimiter,
+  afroguideLimiter,
+  transferLimiter,
+  checkinLimiter,
+  validateRegistration,
+  validateEventCreation,
+  validateTicketTypeCreation,
+};

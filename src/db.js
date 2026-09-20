@@ -332,6 +332,28 @@ CREATE TABLE IF NOT EXISTS fraud_signals (
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS postponed_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS original_starts_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS postpone_reason TEXT;`);
+
+  // ===================== AUDIT LOG IMMUTABILITY =====================
+  // App-level convention ("nothing ever calls UPDATE/DELETE on audit_log")
+  // isn't a real guarantee — a bug, a bad migration, or a compromised
+  // credential could still alter or erase history. This enforces it at the
+  // database layer instead: any UPDATE or DELETE against audit_log is
+  // rejected by Postgres itself, regardless of who issues it or how.
+  // CREATE OR REPLACE FUNCTION and a DROP TRIGGER IF EXISTS + CREATE TRIGGER
+  // pair make this safe to run on every boot, on a fresh or existing database.
+  await pool.query(`
+CREATE OR REPLACE FUNCTION prevent_audit_log_mutation() RETURNS TRIGGER AS $$
+BEGIN
+  RAISE EXCEPTION 'audit_log rows are immutable — % is not permitted', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+  `);
+  await pool.query(`DROP TRIGGER IF EXISTS audit_log_no_update ON audit_log;`);
+  await pool.query(`
+CREATE TRIGGER audit_log_no_update
+BEFORE UPDATE OR DELETE ON audit_log
+FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_mutation();
+  `);
 }
 
 module.exports = { pool, query, one, withTransaction, migrate };

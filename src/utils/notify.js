@@ -9,6 +9,7 @@ const email = require('./emailProvider');
 const sms = require('./smsProvider');
 const whatsapp = require('./whatsappProvider');
 const { renderNotification } = require('./notificationTemplates');
+const pii = require('./piiCrypto');
 
 async function notify(userId, type, payload, channels = ['in_app', 'email']) {
   // notify() must never reject — it's called fire-and-forget in some paths
@@ -19,6 +20,10 @@ async function notify(userId, type, payload, channels = ['in_app', 'email']) {
     let user = null;
     try {
       user = await db.one('SELECT email, phone FROM users WHERE id = $1', [userId]);
+      // phone is stored encrypted (utils/piiCrypto.js) — decrypt before it's
+      // ever handed to an SMS/WhatsApp provider, or delivery would send the
+      // ciphertext instead of a real phone number.
+      if (user) user.phone = pii.decrypt(user.phone);
     } catch (err) {
       // proceed without contact info — in-app row still gets written below
     }

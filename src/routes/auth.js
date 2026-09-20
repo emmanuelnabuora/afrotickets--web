@@ -16,6 +16,7 @@ const { audit } = require('../utils/audit');
 const { validateRegistration } = require('../security');
 const { notify } = require('../utils/notify');
 const mfa = require('../utils/mfa');
+const pii = require('../utils/piiCrypto');
 
 const router = express.Router();
 
@@ -66,7 +67,7 @@ router.post('/register', validateRegistration, async (req, res) => {
   const passwordHash = hashPassword(password);
   const created = await db.one(
     'INSERT INTO users (name, email, password_hash, role, phone) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-    [name, email, passwordHash, finalRole, phone || null]
+    [name, email, passwordHash, finalRole, pii.encrypt(phone) || null]
   );
 
   await audit(created.id, 'user.registered', 'user', created.id, { role: finalRole });
@@ -364,6 +365,47 @@ router.post('/sessions/revoke-all', requireAuth, async (req, res) => {
   await db.query(sql, params);
   await audit(req.user.sub, 'user.sessions_revoked_all', 'user', req.user.sub, { includeCurrent });
   res.json({ message: includeCurrent ? 'All sessions revoked — please log in again' : 'All other sessions revoked' });
+});
+
+// ===================== ACCOUNT DELETION =====================
+
+// Self-service "right to erasure": scrubs personally-identifying fields but
+// keeps the user row (and its id) intact — orders, tickets, refunds, and
+// audit_log all reference user_id, and hard-deleting would either orphan
+// that history or require cascading through financial/legal records this
+// platform is required to keep. Anonymizing in place is the same pattern
+// already used for a cancelled event or removed ticket type (a deleted_at
+// flag, never a DELETE).
+router.post('/delete-account', requireAuth, async (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: 'password is required to confirm account deletion' });
+
+  const row = await db.one('SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL', [req.user.sub]);
+  if (!row) return res.status(404).json({ error: 'Account not found' });
+  if (!verifyPassword(password, row.password_hash)) {
+    return res.status(401).json({ error: 'Incorrect password' });
+  }
+
+  const anonymizedEmail = `deleted-user-${row.id}@deleted.afrotickets.invalid`;
+  const unusablePasswordHash = hashPassword(crypto.randomBytes(32).toString('hex'));
+  await db.query(
+    `UPDATE users SET
+       name = 'Deleted user',
+       email = $1,
+       phone = NULL,
+       password_hash = $2,
+       mfa_secret = NULL,
+       mfa_pending_secret = NULL,
+       mfa_enabled_at = NULL,
+       deleted_at = now()
+     WHERE id = $3`,
+    [anonymizedEmail, unusablePasswordHash, row.id]
+  );
+  await db.query('DELETE FROM mfa_backup_codes WHERE user_id = $1', [row.id]);
+  await db.query('UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL', [row.id]);
+  await audit(row.id, 'user.account_deleted', 'user', row.id, {});
+
+  res.json({ message: 'Your account has been deleted.' });
 });
 
 module.exports = router;

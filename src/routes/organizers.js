@@ -6,8 +6,18 @@ const { requireAuth, requireRole } = require('../auth');
 const { audit } = require('../utils/audit');
 const { notify } = require('../utils/notify');
 const imageStorage = require('../utils/imageStorage');
+const pii = require('../utils/piiCrypto');
+const { validateEventCreation, validateTicketTypeCreation } = require('../security');
 
 const router = express.Router();
+
+// settlement_account is stored encrypted (see utils/piiCrypto.js) — decrypt
+// it only at the point of handing an organizer record back to its own owner
+// or a platform admin, never before.
+function decorateOrganizer(org) {
+  if (!org) return org;
+  return { ...org, settlement_account: pii.decrypt(org.settlement_account) };
+}
 
 async function getOwnedOrganizerOrFail(userId) {
   return db.one('SELECT * FROM organizers WHERE owner_user_id = $1', [userId]);
@@ -24,32 +34,29 @@ router.post('/onboard', requireAuth, requireRole('organizer_owner', 'platform_ad
   if (!name || !country) return res.status(400).json({ error: 'name and country are required' });
 
   const existing = await getOwnedOrganizerOrFail(req.user.sub);
-  if (existing) return res.json({ organizer: existing });
+  if (existing) return res.json({ organizer: decorateOrganizer(existing) });
 
   const created = await db.one(
     `INSERT INTO organizers (owner_user_id, name, country, settlement_method, settlement_account)
      VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [req.user.sub, name, country, settlementMethod || null, settlementAccount || null]
+    [req.user.sub, name, country, settlementMethod || null, pii.encrypt(settlementAccount) || null]
   );
 
   await audit(req.user.sub, 'organizer.onboarded', 'organizer', created.id, { name, country });
-  res.status(201).json({ organizer: created });
+  res.status(201).json({ organizer: decorateOrganizer(created) });
 });
 
 router.get('/me', requireAuth, async (req, res) => {
   const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   if (!organizer) return res.status(404).json({ error: 'No organizer profile yet — call POST /onboard first' });
-  res.json({ organizer });
+  res.json({ organizer: decorateOrganizer(organizer) });
 });
 
-router.post('/events', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+router.post('/events', requireAuth, requireRole('organizer_owner'), validateEventCreation, validateTicketTypeCreation, async (req, res) => {
   const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   if (!organizer) return res.status(400).json({ error: 'Complete organizer onboarding first' });
 
   const { name, category, description, venue, city, country, startsAt, currency, ticketTypes } = req.body;
-  if (!name || !category || !startsAt || !Array.isArray(ticketTypes) || ticketTypes.length === 0) {
-    return res.status(400).json({ error: 'name, category, startsAt, and at least one ticket type are required' });
-  }
 
   const event = await db.one(
     `INSERT INTO events (organizer_id, name, category, description, venue, city, country, starts_at, currency, status)
