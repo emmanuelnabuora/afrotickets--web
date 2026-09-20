@@ -6,6 +6,7 @@
 // provider, so the app is honest about which path a given deployment is on
 // rather than silently pretending a real payment happened.
 const crypto = require('crypto');
+const fs = require('fs');
 
 function baseUrl() {
   return process.env.MPESA_ENV === 'production'
@@ -156,4 +157,107 @@ function verifyCallbackSecret(pathSecret) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-module.exports = { isConfigured, initiateSTKPush, parseCallback, verifyCallbackSecret, normalizePhone };
+// ===================== B2C (organizer payouts) =====================
+// Separate from STK Push credentials on purpose — Daraja's B2C ("send money
+// out") API is a distinct product from Lipa Na M-Pesa Online ("receive
+// money"), with its own initiator identity, RSA-encrypted security
+// credential, and shortcode. Most deployments configure STK Push (to accept
+// payments) long before they ever configure B2C (to pay organizers out),
+// so this is intentionally gated separately — payouts are honest about
+// falling back to manual processing when only STK credentials exist.
+function isB2CConfigured() {
+  return !!(
+    process.env.MPESA_INITIATOR_NAME &&
+    process.env.MPESA_INITIATOR_PASSWORD &&
+    process.env.MPESA_B2C_SHORTCODE &&
+    process.env.MPESA_B2C_CERT_PATH &&
+    process.env.MPESA_B2C_RESULT_URL &&
+    process.env.MPESA_B2C_TIMEOUT_URL
+  );
+}
+
+// Daraja requires the initiator password encrypted with Safaricom's public
+// certificate (a different cert for sandbox vs. production, downloaded from
+// the Daraja portal) — this is not a secret this app invents, it's the
+// documented mechanism, hence reading an actual cert file from disk rather
+// than deriving anything in code.
+function buildSecurityCredential() {
+  const cert = fs.readFileSync(process.env.MPESA_B2C_CERT_PATH, 'utf8');
+  const encrypted = crypto.publicEncrypt(
+    { key: cert, padding: crypto.constants.RSA_PKCS1_PADDING },
+    Buffer.from(process.env.MPESA_INITIATOR_PASSWORD)
+  );
+  return encrypted.toString('base64');
+}
+
+// Initiates a B2C ("BusinessPayment") transfer to an organizer's M-Pesa
+// number. Like STK Push, this only confirms Safaricom *accepted* the
+// request — the actual outcome (moved / failed) arrives later via the
+// ResultURL callback, parsed below by parseB2CResult.
+async function initiateB2CPayout({ phone, amountCents, remarks, occasion }) {
+  const normalizedPhone = normalizePhone(phone);
+  const token = await getAccessToken();
+  const amount = Math.max(1, Math.round(amountCents / 100));
+
+  const res = await fetch(`${baseUrl()}/mpesa/b2c/v1/paymentrequest`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      InitiatorName: process.env.MPESA_INITIATOR_NAME,
+      SecurityCredential: buildSecurityCredential(),
+      CommandID: 'BusinessPayment',
+      Amount: amount,
+      PartyA: process.env.MPESA_B2C_SHORTCODE,
+      PartyB: normalizedPhone,
+      Remarks: String(remarks || 'AfroTickets payout').slice(0, 100),
+      QueueTimeOutURL: process.env.MPESA_B2C_TIMEOUT_URL,
+      ResultURL: process.env.MPESA_B2C_RESULT_URL,
+      Occasion: String(occasion || '').slice(0, 100),
+    }),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ResponseCode !== '0') {
+    throw new Error(data.errorMessage || data.ResponseDescription || `B2C payout request failed (${res.status})`);
+  }
+  return {
+    conversationId: data.ConversationID,
+    originatorConversationId: data.OriginatorConversationID,
+  };
+}
+
+// Parses Safaricom's documented B2C result-callback shape. ResultCode 0
+// means the transfer completed; anything else is a failure (insufficient
+// utility balance, invalid recipient, etc.), with the reason in resultDesc.
+function parseB2CResult(body) {
+  const result = body?.Result;
+  if (!result) throw new Error('Not a recognizable Daraja B2C result payload');
+
+  const params = {};
+  (result.ResultParameters?.ResultParameter || []).forEach((p) => { params[p.Key] = p.Value; });
+
+  return {
+    conversationId: result.ConversationID,
+    originatorConversationId: result.OriginatorConversationID,
+    transactionId: result.TransactionID || null,
+    resultCode: result.ResultCode,
+    resultDesc: result.ResultDesc,
+    success: result.ResultCode === 0,
+    transactionAmount: params.TransactionAmount,
+    receiverPartyPublicName: params.ReceiverPartyPublicName,
+  };
+}
+
+module.exports = {
+  isConfigured,
+  initiateSTKPush,
+  parseCallback,
+  verifyCallbackSecret,
+  normalizePhone,
+  isB2CConfigured,
+  initiateB2CPayout,
+  parseB2CResult,
+};

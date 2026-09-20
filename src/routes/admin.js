@@ -229,4 +229,110 @@ router.post('/refunds/:id/approve', async (req, res) => {
   res.json({ message: `Refund ${result.status}`, refundStatus: result.status });
 });
 
+// ===================== ORGANIZER PAYOUTS REVIEW QUEUE =====================
+const { processPayoutWithProvider } = require('./payouts');
+
+router.post('/organizers/:id/freeze-payouts', async (req, res) => {
+  const org = await db.one('SELECT * FROM organizers WHERE id = $1', [req.params.id]);
+  if (!org) return res.status(404).json({ error: 'Organizer not found' });
+  await db.query(
+    `UPDATE organizers SET payouts_frozen_at = now(), payouts_frozen_reason = $1 WHERE id = $2`,
+    [req.body?.reason || null, org.id]
+  );
+  await audit(req.user.sub, 'organizer.payouts_frozen', 'organizer', org.id, { reason: req.body?.reason });
+  await notify(org.owner_user_id, 'organizer.payouts_frozen', { reason: req.body?.reason }, ['in_app', 'email']);
+  res.json({ message: 'Payouts frozen for this organizer' });
+});
+
+router.post('/organizers/:id/unfreeze-payouts', async (req, res) => {
+  const org = await db.one('SELECT * FROM organizers WHERE id = $1', [req.params.id]);
+  if (!org) return res.status(404).json({ error: 'Organizer not found' });
+  await db.query(`UPDATE organizers SET payouts_frozen_at = NULL, payouts_frozen_reason = NULL WHERE id = $1`, [org.id]);
+  await audit(req.user.sub, 'organizer.payouts_unfrozen', 'organizer', org.id, {});
+  await notify(org.owner_user_id, 'organizer.payouts_unfrozen', {}, ['in_app', 'email']);
+  res.json({ message: 'Payouts unfrozen for this organizer' });
+});
+
+router.get('/payouts/pending', async (req, res) => {
+  const rows = await db.query(
+    `SELECT p.*, o.name AS organizer_name, o.payouts_frozen_at, e.name AS event_name, e.currency
+     FROM payouts p
+     JOIN organizers o ON o.id = p.organizer_id
+     JOIN events e ON e.id = p.event_id
+     WHERE p.status = 'requested'
+     ORDER BY p.created_at ASC`
+  );
+  res.json({ payouts: rows });
+});
+
+router.post('/payouts/:id/reject', async (req, res) => {
+  const payout = await db.one('SELECT * FROM payouts WHERE id = $1', [req.params.id]);
+  if (!payout) return res.status(404).json({ error: 'Payout not found' });
+  if (payout.status !== 'requested') {
+    return res.status(409).json({ error: `This payout is no longer pending — current status: ${payout.status}` });
+  }
+  await db.query(
+    `UPDATE payouts SET status = 'rejected', decided_by_user_id = $1, decision_reason = $2, decided_at = now() WHERE id = $3`,
+    [req.user.sub, req.body?.reason || null, payout.id]
+  );
+  await audit(req.user.sub, 'payout.rejected', 'payout', payout.id, { reason: req.body?.reason });
+  const organizer = await db.one('SELECT * FROM organizers WHERE id = $1', [payout.organizer_id]);
+  await notify(organizer.owner_user_id, 'payout.rejected', { payoutId: payout.id, reason: req.body?.reason }, ['in_app', 'email']);
+  res.json({ message: 'Payout rejected' });
+});
+
+router.post('/payouts/:id/approve', async (req, res) => {
+  const payout = await db.one('SELECT * FROM payouts WHERE id = $1', [req.params.id]);
+  if (!payout) return res.status(404).json({ error: 'Payout not found' });
+  if (payout.status !== 'requested') {
+    return res.status(409).json({ error: `This payout is no longer pending — current status: ${payout.status}` });
+  }
+
+  const organizer = await db.one('SELECT * FROM organizers WHERE id = $1', [payout.organizer_id]);
+  if (organizer.payouts_frozen_at) {
+    return res.status(409).json({
+      error: `Payouts are frozen for this organizer${organizer.payouts_frozen_reason ? `: ${organizer.payouts_frozen_reason}` : ''} — unfreeze before approving`,
+    });
+  }
+
+  // Atomic claim — same principle as refund approval: only one admin's
+  // approval of this specific payout can win the transition out of
+  // 'requested', so a double-click or two admins racing can't both
+  // dispatch the same payment.
+  const claimed = await db.query(
+    `UPDATE payouts SET status = 'approved_processing', decided_by_user_id = $1, decided_at = now() WHERE id = $2 AND status = 'requested' RETURNING *`,
+    [req.user.sub, payout.id]
+  );
+  if (claimed.length === 0) {
+    return res.status(409).json({ error: 'This payout was just decided by someone else' });
+  }
+
+  const result = await processPayoutWithProvider({ organizer, payout: claimed[0] });
+
+  if (result.status !== 'processing') {
+    await db.query(
+      `UPDATE payouts SET status = $1, provider = $2, provider_payout_id = $3, completed_at = $4 WHERE id = $5`,
+      [result.status, result.provider, result.providerPayoutId, result.status === 'succeeded' ? new Date().toISOString() : null, payout.id]
+    );
+  } else {
+    await db.query(`UPDATE payouts SET provider = $1, provider_payout_id = $2 WHERE id = $3`, [result.provider, result.providerPayoutId, payout.id]);
+  }
+
+  await audit(req.user.sub, 'payout.approved', 'payout', payout.id, {
+    amountCents: payout.amount_cents,
+    result: result.status,
+    provider: result.provider,
+  });
+
+  if (result.status === 'manual_required') {
+    await notify(organizer.owner_user_id, 'payout.manual_required', { payoutId: payout.id, amountCents: payout.amount_cents }, ['in_app', 'email']);
+  } else if (result.status === 'failed') {
+    await notify(organizer.owner_user_id, 'payout.failed', { payoutId: payout.id }, ['in_app', 'email']);
+  } else if (result.status === 'processing') {
+    await notify(organizer.owner_user_id, 'payout.processing', { payoutId: payout.id, amountCents: payout.amount_cents }, ['in_app', 'email']);
+  }
+
+  res.json({ message: `Payout ${result.status}`, payoutStatus: result.status });
+});
+
 module.exports = router;

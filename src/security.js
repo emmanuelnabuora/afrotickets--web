@@ -77,6 +77,18 @@ const checkinLimiter = rateLimit({
   message: { error: 'Too many check-in requests — please slow down.' },
 });
 
+// Ticketmaster aggregation calls an external API with a real daily quota
+// (5,000 requests/day on Ticketmaster's free Discovery API tier) — this
+// bounds cost/quota exposure from a single client hammering it, same
+// reasoning as afroguideLimiter above for the Anthropic API.
+const aggregationLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many discovery searches — please wait a few minutes and try again.' },
+});
+
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function validateRegistration(req, res, next) {
@@ -158,6 +170,7 @@ module.exports = {
   authLimiter,
   checkoutLimiter,
   afroguideLimiter,
+  aggregationLimiter,
   transferLimiter,
   checkinLimiter,
   validateRegistration,

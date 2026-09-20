@@ -311,6 +311,34 @@ CREATE TABLE IF NOT EXISTS fraud_signals (
   status TEXT NOT NULL DEFAULT 'open',
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- ===================== ORGANIZER PAYOUTS =====================
+-- One row per (event, kind) — 'initial' (proceeds minus a held-back reserve,
+-- payable once the event has happened) and 'reserve_release' (the reserve
+-- itself, payable once the hold window has passed, net of any refunds that
+-- happened during the hold). UNIQUE(event_id, kind) is what makes the
+-- auto-generation sweep (utils/payoutScheduler.js) idempotent — it can
+-- safely re-scan every event on every run without ever double-creating a
+-- payout, the same idempotency principle as every CREATE TABLE IF NOT
+-- EXISTS in this file. Like refunds, a payout is always a request first,
+-- an admin decision second — money never moves without that review.
+CREATE TABLE IF NOT EXISTS payouts (
+  id SERIAL PRIMARY KEY,
+  organizer_id INTEGER NOT NULL REFERENCES organizers(id),
+  event_id INTEGER NOT NULL REFERENCES events(id),
+  kind TEXT NOT NULL DEFAULT 'initial', -- initial | reserve_release
+  gross_cents INTEGER NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'requested', -- requested | approved_processing | succeeded | failed | rejected | manual_required
+  provider TEXT,
+  provider_payout_id TEXT,
+  decided_by_user_id INTEGER REFERENCES users(id),
+  decision_reason TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  decided_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ,
+  UNIQUE(event_id, kind)
+);
   `);
 
   // CREATE TABLE IF NOT EXISTS is a no-op against a table that already exists
@@ -332,6 +360,8 @@ CREATE TABLE IF NOT EXISTS fraud_signals (
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS postponed_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS original_starts_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS postpone_reason TEXT;`);
+  await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS payouts_frozen_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS payouts_frozen_reason TEXT;`);
 
   // ===================== AUDIT LOG IMMUTABILITY =====================
   // App-level convention ("nothing ever calls UPDATE/DELETE on audit_log")

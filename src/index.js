@@ -20,6 +20,9 @@ const afroguideRoutes = require('./routes/afroguide');
 const savedRoutes = require('./routes/saved');
 const notificationRoutes = require('./routes/notifications');
 const refundRoutes = require('./routes/refunds');
+const payoutRoutes = require('./routes/payouts');
+const discoverRoutes = require('./routes/discover');
+const { startPayoutScheduler } = require('./utils/payoutScheduler');
 
 const app = express();
 
@@ -59,8 +62,13 @@ app.use((req, res, next) => {
 });
 
 const { version: APP_VERSION } = require('../package.json');
-app.get('/health', (req, res) => res.json({ ok: true, service: 'afrotickets-api', version: APP_VERSION }));
-app.get('/version', (req, res) => res.json({ version: APP_VERSION, db: 'postgres' }));
+// Which deployment this is — 'production' unless a staging (or other)
+// service explicitly sets APP_ENV. Surfaced on /health and /version so
+// hitting the wrong URL (e.g. prod when you meant staging) is obvious from
+// the response itself, not just inferred from which hostname you typed.
+const APP_ENV = process.env.APP_ENV || 'production';
+app.get('/health', (req, res) => res.json({ ok: true, service: 'afrotickets-api', version: APP_VERSION, env: APP_ENV }));
+app.get('/version', (req, res) => res.json({ version: APP_VERSION, db: 'postgres', env: APP_ENV }));
 // Public, non-secret config the frontend needs to initialize client-side SDKs.
 // The Stripe *publishable* key is safe to expose — it's designed to be
 // public and can't authorize charges on its own, unlike the secret key.
@@ -86,6 +94,8 @@ app.use('/api/afroguide', afroguideRoutes);
 app.use('/api/saved', savedRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/api/refunds', refundRoutes);
+app.use('/api/payouts', payoutRoutes);
+app.use('/api/discover', discoverRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 // eslint-disable-next-line no-unused-vars
@@ -101,6 +111,7 @@ async function start() {
   // instances concurrently; CREATE TABLE IF NOT EXISTS makes that a no-op race.
   await db.migrate();
   startRetentionSweep();
+  startPayoutScheduler();
   app.listen(PORT, () => {
     console.log(`AfroTickets API listening on port ${PORT}`);
   });
