@@ -106,7 +106,33 @@ CREATE TABLE IF NOT EXISTS orders (
   currency TEXT NOT NULL,
   payment_intent_id TEXT UNIQUE,
   reservation_expires_at TIMESTAMPTZ,
+  refunded_cents INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- ===================== REFUNDS AND DISPUTES =====================
+-- Every refund is a request first (customer-initiated) and a decision
+-- second (admin approve/reject) — money never moves without a human in the
+-- loop, which is the actual "dispute workflow" the go-live checklist asks
+-- for. orders.refunded_cents tracks the running total already refunded so
+-- concurrent/duplicate approvals can be checked atomically (same pattern as
+-- the oversell fix's atomic conditional UPDATE) rather than trusting a
+-- point-in-time SELECT.
+CREATE TABLE IF NOT EXISTS refunds (
+  id SERIAL PRIMARY KEY,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  requested_by_user_id INTEGER NOT NULL REFERENCES users(id),
+  amount_cents INTEGER NOT NULL,
+  reason TEXT,
+  status TEXT NOT NULL DEFAULT 'requested', -- requested | approved_processing | succeeded | failed | rejected | manual_required
+  provider TEXT,
+  provider_refund_id TEXT,
+  idempotency_key TEXT UNIQUE,
+  decided_by_user_id INTEGER REFERENCES users(id),
+  decision_reason TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  decided_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS resale_listings (
@@ -237,6 +263,8 @@ CREATE TABLE IF NOT EXISTS fraud_signals (
   // idempotent ALTER here so upgrading a live database is always safe to
   // just run again on every boot.
   await pool.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;`);
+  await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_cents INTEGER NOT NULL DEFAULT 0;`);
 }
 
 module.exports = { pool, query, one, withTransaction, migrate };

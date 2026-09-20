@@ -41,4 +41,12 @@ function simulateAsyncCallback({ paymentIntentId, outcome = 'succeeded' }, onCal
   }, 1200);
 }
 
-module.exports = { createPaymentIntent, signWebhookPayload, verifyWebhookSignature, simulateAsyncCallback };
+// Real gateways settle a refund near-instantly on their own dashboard/API
+// with no separate webhook round-trip needed by the caller, so the mock
+// mirrors that: an immediate synchronous "success" rather than the
+// async-callback dance used for the original charge.
+function createRefund({ amountCents }) {
+  return { id: 're_' + crypto.randomBytes(10).toString('hex'), status: 'succeeded', amountCents };
+}
+
+module.exports = { createPaymentIntent, signWebhookPayload, verifyWebhookSignature, simulateAsyncCallback, createRefund };

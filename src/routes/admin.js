@@ -105,4 +105,124 @@ router.post('/fraud-signals/:id/action', async (req, res) => {
   res.json({ message: 'Signal marked actioned' });
 });
 
+// ===================== REFUNDS / DISPUTES REVIEW QUEUE =====================
+const { processRefundWithProvider } = require('./refunds');
+
+router.get('/refunds/pending', async (req, res) => {
+  const rows = await db.query(
+    `SELECT r.*, o.total_cents AS order_total_cents, o.currency, o.refunded_cents AS order_refunded_cents,
+            u.name AS customer_name, u.email AS customer_email
+     FROM refunds r
+     JOIN orders o ON o.id = r.order_id
+     JOIN users u ON u.id = r.requested_by_user_id
+     WHERE r.status = 'requested'
+     ORDER BY r.created_at ASC`
+  );
+  res.json({ refunds: rows });
+});
+
+router.post('/refunds/:id/reject', async (req, res) => {
+  const refund = await db.one('SELECT * FROM refunds WHERE id = $1', [req.params.id]);
+  if (!refund) return res.status(404).json({ error: 'Refund request not found' });
+  if (refund.status !== 'requested') {
+    return res.status(409).json({ error: `This refund request is no longer pending — current status: ${refund.status}` });
+  }
+
+  await db.query(
+    `UPDATE refunds SET status = 'rejected', decided_by_user_id = $1, decision_reason = $2, decided_at = now() WHERE id = $3`,
+    [req.user.sub, req.body?.reason || null, refund.id]
+  );
+  await audit(req.user.sub, 'refund.rejected', 'refund', refund.id, { reason: req.body?.reason });
+  await notify(refund.requested_by_user_id, 'refund.rejected', { orderId: refund.order_id, reason: req.body?.reason }, ['in_app', 'email']);
+  res.json({ message: 'Refund request rejected' });
+});
+
+router.post('/refunds/:id/approve', async (req, res) => {
+  const refund = await db.one('SELECT * FROM refunds WHERE id = $1', [req.params.id]);
+  if (!refund) return res.status(404).json({ error: 'Refund request not found' });
+  if (refund.status !== 'requested') {
+    return res.status(409).json({ error: `This refund request is no longer pending — current status: ${refund.status}` });
+  }
+
+  // Atomic conditional UPDATE — same principle as the oversell fix: the
+  // running total (refunded_cents) is checked AND incremented in one
+  // statement, inside a transaction, so two admins approving two different
+  // pending requests on the same order at the same instant can't jointly
+  // refund more than the order actually cost. 0 rows back means someone
+  // else's approval (or a race) already used up the remaining balance.
+  let order;
+  try {
+    order = await db.withTransaction(async (tx) => {
+      const claimed = await tx.query(
+        `UPDATE orders SET refunded_cents = refunded_cents + $1
+         WHERE id = $2 AND refunded_cents + $1 <= total_cents
+         RETURNING *`,
+        [refund.amount_cents, refund.order_id]
+      );
+      if (claimed.length === 0) {
+        throw Object.assign(
+          new Error('Approving this would exceed the order total — another refund may have just been approved for it'),
+          { status: 409 }
+        );
+      }
+      await tx.query(`UPDATE refunds SET status = 'approved_processing', decided_by_user_id = $1, decided_at = now() WHERE id = $2`, [req.user.sub, refund.id]);
+      return claimed[0];
+    });
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message });
+  }
+
+  const isFullRefund = order.refunded_cents >= order.total_cents;
+
+  const result = await processRefundWithProvider({ order, refund });
+
+  await db.withTransaction(async (tx) => {
+    await tx.query(
+      `UPDATE refunds SET status = $1, provider = $2, provider_refund_id = $3, completed_at = $4 WHERE id = $5`,
+      [
+        result.status === 'succeeded' ? 'succeeded' : result.status === 'manual_required' ? 'manual_required' : 'failed',
+        result.provider,
+        result.providerRefundId,
+        result.status === 'succeeded' ? new Date().toISOString() : null,
+        refund.id,
+      ]
+    );
+
+    if (result.status === 'succeeded' && isFullRefund) {
+      const items = await tx.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
+      await tx.query(`UPDATE orders SET status = 'refunded' WHERE id = $1`, [order.id]);
+      const ticketRows = await tx.query('SELECT id FROM tickets WHERE order_id = $1', [order.id]);
+      for (const t of ticketRows) {
+        await tx.query(`UPDATE tickets SET status = 'invalidated' WHERE id = $1`, [t.id]);
+      }
+    } else if (result.status === 'succeeded' && !isFullRefund) {
+      await tx.query(`UPDATE orders SET status = 'partially_refunded' WHERE id = $1`, [order.id]);
+    } else if (result.status === 'failed') {
+      // Refund failed at the provider after we already committed to it —
+      // roll back the running total we reserved so it doesn't permanently
+      // eat into the order's refundable balance.
+      await tx.query(`UPDATE orders SET refunded_cents = refunded_cents - $1 WHERE id = $2`, [refund.amount_cents, order.id]);
+    }
+    // manual_required: refunded_cents stays claimed (money is committed to
+    // go out, just via a manual channel) and order status is left as-is
+    // until the manual M-Pesa reversal is confirmed and this is revisited.
+  });
+
+  await audit(req.user.sub, 'refund.approved', 'refund', refund.id, { amountCents: refund.amount_cents, result: result.status, provider: result.provider });
+
+  if (result.status === 'succeeded') {
+    await notify(refund.requested_by_user_id, 'refund.approved', {
+      orderId: order.id,
+      amountFormatted: `${(refund.amount_cents / 100).toFixed(2)} ${order.currency}`,
+      fullRefund: isFullRefund,
+    }, ['in_app', 'email']);
+  } else if (result.status === 'manual_required') {
+    await notify(refund.requested_by_user_id, 'refund.manual_required', { orderId: order.id }, ['in_app', 'email']);
+  } else {
+    await notify(refund.requested_by_user_id, 'refund.failed', { orderId: order.id }, ['in_app', 'email']);
+  }
+
+  res.json({ message: `Refund ${result.status}`, refundStatus: result.status });
+});
+
 module.exports = router;

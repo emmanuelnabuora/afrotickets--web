@@ -17,6 +17,7 @@ const resaleRoutes = require('./routes/resale');
 const afroguideRoutes = require('./routes/afroguide');
 const savedRoutes = require('./routes/saved');
 const notificationRoutes = require('./routes/notifications');
+const refundRoutes = require('./routes/refunds');
 
 const app = express();
 
@@ -35,7 +36,7 @@ app.use(generalLimiter);
 // JSON parser explicitly skips them (chaining both on one path would try to
 // read the request stream twice). A size limit on both bounds memory use
 // from a client sending an oversized body.
-const WEBHOOK_PATHS = ['/api/orders/webhook/payments', '/api/resale/webhook/payments'];
+const WEBHOOK_PATHS = ['/api/orders/webhook/payments', '/api/resale/webhook/payments', '/api/orders/webhook/stripe'];
 WEBHOOK_PATHS.forEach((p) => app.use(p, express.raw({ type: '*/*', limit: '100kb' })));
 app.use((req, res, next) => {
   if (WEBHOOK_PATHS.includes(req.path)) return next();
@@ -45,6 +46,10 @@ app.use((req, res, next) => {
 const { version: APP_VERSION } = require('../package.json');
 app.get('/health', (req, res) => res.json({ ok: true, service: 'afrotickets-api', version: APP_VERSION }));
 app.get('/version', (req, res) => res.json({ version: APP_VERSION, db: 'postgres' }));
+// Public, non-secret config the frontend needs to initialize client-side SDKs.
+// The Stripe *publishable* key is safe to expose — it's designed to be
+// public and can't authorize charges on its own, unlike the secret key.
+app.get('/api/config', (req, res) => res.json({ stripePublishableKey: process.env.STRIPE_PUBLISHABLE_KEY || null }));
 
 app.use('/api/auth/register', authLimiter);
 app.use('/api/auth/login', authLimiter);
@@ -60,6 +65,7 @@ app.use('/api/resale', resaleRoutes);
 app.use('/api/afroguide', afroguideRoutes);
 app.use('/api/saved', savedRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/refunds', refundRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 // eslint-disable-next-line no-unused-vars

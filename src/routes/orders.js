@@ -13,6 +13,7 @@ const {
   simulateAsyncCallback,
 } = require('../utils/mockPaymentProvider');
 const mpesa = require('../utils/mpesaProvider');
+const stripeProvider = require('../utils/stripeProvider');
 
 const router = express.Router();
 
@@ -67,10 +68,51 @@ async function reserveAndCreateOrder({ userId, eventId, currency, subtotalCents,
         `INSERT INTO order_items (order_id, ticket_type_id, quantity, unit_price_cents, seat_ids) VALUES ($1, $2, $3, $4, $5)`,
         [created.id, ticketType.id, quantity, ticketType.price_cents, seatIds ? JSON.stringify(seatIds) : null]
       );
-      await tx.query('UPDATE ticket_types SET quantity_reserved = quantity_reserved + $1 WHERE id = $2', [quantity, ticketType.id]);
+
       if (seatIds) {
+        // Seat-level lock: this UPDATE is the single atomic operation that both
+        // checks and claims each seat. Two concurrent requests for the same
+        // seat can both have passed the earlier (non-authoritative) SELECT in
+        // validateAndResolveItems, but only one of them can win this UPDATE —
+        // the other gets 0 rows back and the whole order rolls back.
         for (const seatId of seatIds) {
-          await tx.query(`UPDATE event_seats SET status = 'reserved' WHERE id = $1`, [seatId]);
+          const claimed = await tx.query(
+            `UPDATE event_seats SET status = 'reserved'
+             WHERE id = $1 AND event_id = $2 AND ticket_type_id = $3 AND status = 'available'
+             RETURNING id`,
+            [seatId, eventId, ticketType.id]
+          );
+          if (claimed.length === 0) {
+            throw Object.assign(
+              new Error('One of the selected seats was just taken by another buyer — please pick a different seat'),
+              { status: 409 }
+            );
+          }
+        }
+        // Seat status above is the authoritative lock; this counter is a
+        // mirror for reporting/quantity math, so it doesn't need its own
+        // conditional guard.
+        await tx.query('UPDATE ticket_types SET quantity_reserved = quantity_reserved + $1 WHERE id = $2', [quantity, ticketType.id]);
+      } else {
+        // General-admission lock: a single atomic conditional UPDATE that
+        // re-checks capacity against quantity_total at write time, inside
+        // the same statement that claims the inventory. No SELECT-then-UPDATE
+        // gap exists here for a concurrent request to exploit — Postgres
+        // serializes concurrent UPDATEs to the same row, so only one of two
+        // simultaneous requests for the last ticket can satisfy the WHERE
+        // clause; the loser gets 0 rows back.
+        const claimed = await tx.query(
+          `UPDATE ticket_types
+           SET quantity_reserved = quantity_reserved + $1
+           WHERE id = $2 AND quantity_reserved + quantity_sold + $1 <= quantity_total
+           RETURNING id`,
+          [quantity, ticketType.id]
+        );
+        if (claimed.length === 0) {
+          throw Object.assign(
+            new Error(`"${ticketType.name}" just sold out — someone else bought the remaining tickets`),
+            { status: 409 }
+          );
         }
       }
     }
@@ -107,6 +149,10 @@ router.post('/', requireAuth, checkoutLimiter, async (req, res) => {
     // reservation for a payment that was never actually requested.
     if (!phone) return res.status(400).json({ error: 'phone is required for M-Pesa payments' });
 
+    // Opportunistically capture the customer's phone number for future SMS/
+    // WhatsApp notifications — never overwrite one they've already set.
+    db.query('UPDATE users SET phone = $1 WHERE id = $2 AND phone IS NULL', [phone, req.user.sub]).catch(() => {});
+
     let stk;
     try {
       stk = await mpesa.initiateSTKPush({
@@ -127,7 +173,13 @@ router.post('/', requireAuth, checkoutLimiter, async (req, res) => {
         paymentIntentId: stk.checkoutRequestId, resolvedItems,
       });
     } catch (err) {
-      return res.status(500).json({ error: 'Checkout failed after STK push was sent — contact support with this reference: ' + stk.checkoutRequestId, detail: err.message });
+      // A 409 here means a concurrent buyer won the last unit/seat between
+      // our pre-check and the atomic reservation, after the STK push had
+      // already been sent — the customer needs a clear "you weren't charged
+      // for this" message alongside the support reference, not a generic 500.
+      const status = err.status || 500;
+      const prefix = err.status === 409 ? err.message + ' — ' : 'Checkout failed after STK push was sent — ';
+      return res.status(status).json({ error: prefix + 'contact support with this reference: ' + stk.checkoutRequestId, detail: err.message });
     }
 
     await audit(req.user.sub, 'order.created', 'order', order.id, { totalCents, paymentIntentId: stk.checkoutRequestId, provider: 'mpesa_daraja' });
@@ -138,6 +190,55 @@ router.post('/', requireAuth, checkoutLimiter, async (req, res) => {
       paymentIntentId: stk.checkoutRequestId,
       provider: 'mpesa_daraja',
       message: stk.customerMessage || 'Check your phone and enter your M-Pesa PIN to complete payment.',
+    });
+  }
+
+  const useStripe = paymentMethod === 'stripe' && stripeProvider.isConfigured();
+
+  if (useStripe) {
+    // Creating a PaymentIntent has no side effects — nothing is charged until
+    // the customer confirms their card client-side — so it's safe to reserve
+    // inventory and create the order first, then open the PaymentIntent.
+    let order;
+    try {
+      order = await reserveAndCreateOrder({
+        userId: req.user.sub, eventId, currency: event.currency,
+        subtotalCents, feeCents, taxCents, totalCents,
+        paymentIntentId: null, resolvedItems,
+      });
+    } catch (err) {
+      return res.status(err.status || 500).json({ error: err.status === 409 ? err.message : 'Checkout failed', detail: err.message });
+    }
+
+    let intent;
+    try {
+      intent = await stripeProvider.createPaymentIntent({
+        amountCents: totalCents,
+        currency: event.currency,
+        metadata: { orderId: String(order.id), eventId: String(eventId) },
+      });
+    } catch (err) {
+      // The order/reservation already exists at this point — release it
+      // rather than leaving inventory stuck reserved for a payment that
+      // was never actually opened.
+      await db.query(`UPDATE orders SET status = 'failed' WHERE id = $1`, [order.id]);
+      const items = await db.query('SELECT * FROM order_items WHERE order_id = $1', [order.id]);
+      for (const item of items) {
+        await db.query('UPDATE ticket_types SET quantity_reserved = quantity_reserved - $1 WHERE id = $2', [item.quantity, item.ticket_type_id]);
+      }
+      return res.status(502).json({ error: `Stripe request failed: ${err.message}` });
+    }
+
+    await db.query('UPDATE orders SET payment_intent_id = $1 WHERE id = $2', [intent.id, order.id]);
+    await audit(req.user.sub, 'order.created', 'order', order.id, { totalCents, paymentIntentId: intent.id, provider: 'stripe' });
+    await checkOrderVelocity(req.user.sub, eventId);
+
+    return res.status(201).json({
+      order: { ...order, payment_intent_id: intent.id },
+      paymentIntentId: intent.id,
+      clientSecret: intent.clientSecret,
+      provider: 'stripe',
+      message: 'Confirm your card details to complete payment.',
     });
   }
 
@@ -158,7 +259,7 @@ router.post('/', requireAuth, checkoutLimiter, async (req, res) => {
       subtotalCents, feeCents, taxCents, totalCents, paymentIntentId, resolvedItems,
     });
   } catch (err) {
-    return res.status(500).json({ error: 'Checkout failed', detail: err.message });
+    return res.status(err.status || 500).json({ error: err.status === 409 ? err.message : 'Checkout failed', detail: err.message });
   }
 
   await audit(req.user.sub, 'order.created', 'order', order.id, { totalCents, paymentIntentId });
@@ -220,6 +321,47 @@ router.post('/webhook/mpesa/:secret', async (req, res) => {
     });
   } catch (err) {
     console.error('M-Pesa callback processing failed:', err.message);
+  }
+});
+
+// Real Stripe webhook. Unlike M-Pesa, Stripe's SDK verifies a cryptographic
+// signature over the raw body itself (the `stripe-signature` header), so
+// this route needs the exact unparsed bytes — mounted with express.raw() in
+// index.js, same pattern as the mock provider's webhook.
+router.post('/webhook/stripe', async (req, res) => {
+  const signature = req.headers['stripe-signature'];
+  let event;
+  try {
+    event = stripeProvider.constructWebhookEvent(req.body, signature);
+  } catch (err) {
+    return res.status(400).json({ error: `Webhook signature verification failed: ${err.message}` });
+  }
+
+  // Ack immediately — Stripe just needs a 2xx quickly, and will retry with
+  // exponential backoff (up to 3 days) if it doesn't get one in time.
+  res.json({ received: true });
+
+  try {
+    if (event.type !== 'payment_intent.succeeded' && event.type !== 'payment_intent.payment_failed') {
+      return; // ignore event types we don't act on (Stripe sends many kinds)
+    }
+    const intent = event.data.object;
+    const order = await db.one('SELECT * FROM orders WHERE payment_intent_id = $1', [intent.id]);
+    if (!order) {
+      console.error('Stripe webhook for unknown PaymentIntent', intent.id);
+      return;
+    }
+    if (order.status !== 'pending_payment') {
+      return; // already finalized — Stripe retries undelivered webhooks too
+    }
+    await finalizeOrderPayment(order, {
+      status: event.type === 'payment_intent.succeeded' ? 'succeeded' : 'failed',
+      provider: 'stripe',
+      idempotencyKey: `stripe_${event.id}`, // Stripe's event.id is globally unique per event — ideal idempotency key
+      rawPayload: JSON.stringify(event),
+    });
+  } catch (err) {
+    console.error('Stripe webhook processing failed:', err.message);
   }
 });
 

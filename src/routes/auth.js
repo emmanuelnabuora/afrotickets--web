@@ -8,7 +8,7 @@ const { validateRegistration } = require('../security');
 const router = express.Router();
 
 router.post('/register', validateRegistration, async (req, res) => {
-  const { name, email, password, role } = req.body;
+  const { name, email, password, role, phone } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ error: 'name, email, and password are required' });
   }
@@ -20,8 +20,8 @@ router.post('/register', validateRegistration, async (req, res) => {
 
   const passwordHash = hashPassword(password);
   const created = await db.one(
-    'INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING id',
-    [name, email, passwordHash, finalRole]
+    'INSERT INTO users (name, email, password_hash, role, phone) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+    [name, email, passwordHash, finalRole, phone || null]
   );
 
   const user = { id: created.id, name, email, role: finalRole };
