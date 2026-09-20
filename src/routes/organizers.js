@@ -1,13 +1,22 @@
 // src/routes/organizers.js
 const express = require('express');
+const multer = require('multer');
 const db = require('../db');
 const { requireAuth, requireRole } = require('../auth');
 const { audit } = require('../utils/audit');
+const { notify } = require('../utils/notify');
+const imageStorage = require('../utils/imageStorage');
 
 const router = express.Router();
 
 async function getOwnedOrganizerOrFail(userId) {
   return db.one('SELECT * FROM organizers WHERE owner_user_id = $1', [userId]);
+}
+
+async function getOwnedEventOrFail(userId, eventId) {
+  const organizer = await getOwnedOrganizerOrFail(userId);
+  if (!organizer) return null;
+  return db.one('SELECT * FROM events WHERE id = $1 AND organizer_id = $2 AND deleted_at IS NULL', [eventId, organizer.id]);
 }
 
 router.post('/onboard', requireAuth, requireRole('organizer_owner', 'platform_admin'), async (req, res) => {
@@ -123,6 +132,207 @@ router.get('/events/:id/analytics', requireAuth, requireRole('organizer_owner'),
     checkedIn: Number(checkedInRow.n),
     byTicketType: byType,
   });
+});
+
+// ===================== EDIT / CANCEL / POSTPONE =====================
+
+// Fields that never affect a ticket holder's expectations, so they're
+// editable at any time. Anything that does (venue/city/country/currency/
+// date) is locked once a single ticket has actually sold — a date change
+// specifically has its own endpoint (/postpone) because it needs to notify
+// ticket holders, which a generic PATCH shouldn't silently do.
+const EDITABLE_ALWAYS = { name: 'name', category: 'category', description: 'description' };
+const EDITABLE_IF_UNSOLD = { venue: 'venue', city: 'city', country: 'country', currency: 'currency', startsAt: 'starts_at' };
+
+router.patch('/events/:id', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (event.status === 'cancelled') return res.status(400).json({ error: 'Cannot edit a cancelled event' });
+
+  const soldRow = await db.one('SELECT COALESCE(SUM(quantity_sold),0) AS sold FROM ticket_types WHERE event_id = $1', [event.id]);
+  const hasSold = Number(soldRow.sold) > 0;
+
+  const updates = {};
+  const blocked = [];
+  for (const [field, column] of Object.entries(EDITABLE_ALWAYS)) {
+    if (req.body[field] !== undefined) updates[column] = req.body[field];
+  }
+  for (const [field, column] of Object.entries(EDITABLE_IF_UNSOLD)) {
+    if (req.body[field] !== undefined) {
+      if (hasSold) blocked.push(field);
+      else updates[column] = req.body[field];
+    }
+  }
+  if (blocked.length > 0) {
+    const suffix = blocked.includes('startsAt') ? ' — use POST /events/:id/postpone to reschedule instead' : '';
+    return res.status(400).json({ error: `Cannot change ${blocked.join(', ')} once tickets have been sold${suffix}` });
+  }
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: 'No editable fields provided' });
+  }
+
+  const columns = Object.keys(updates);
+  const values = Object.values(updates);
+  const setClause = columns.map((col, i) => `${col} = $${i + 1}`).join(', ');
+  values.push(event.id);
+  const updated = await db.one(`UPDATE events SET ${setClause} WHERE id = $${values.length} RETURNING *`, values);
+
+  await audit(req.user.sub, 'event.updated', 'event', event.id, { fields: columns });
+  res.json({ event: updated });
+});
+
+router.post('/events/:id/cancel', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (event.status === 'cancelled') return res.status(400).json({ error: 'Event is already cancelled' });
+
+  const reason = req.body?.reason || null;
+
+  await db.query(
+    `UPDATE events SET status = 'cancelled', cancelled_at = now(), cancellation_reason = $1 WHERE id = $2`,
+    [reason, event.id]
+  );
+
+  // Invalidating every live ticket alone blocks check-in and resale, since
+  // both already gate on status = 'valid' — no new enforcement code needed.
+  const invalidatedTickets = await db.query(
+    `UPDATE tickets SET status = 'invalidated' WHERE event_id = $1 AND status != 'invalidated' RETURNING id, owner_user_id`,
+    [event.id]
+  );
+  await db.query(`UPDATE resale_listings SET status = 'removed' WHERE event_id = $1 AND status = 'active'`, [event.id]);
+  await db.query(`UPDATE orders SET status = 'cancelled' WHERE event_id = $1 AND status = 'pending_payment'`, [event.id]);
+
+  // Every paid order gets a refund request opened on the customer's behalf
+  // for its full remaining balance — an admin still has to approve it (the
+  // same review queue as any other refund; money never moves without that),
+  // but the customer shouldn't have to ask when the organizer caused this.
+  const refundableOrders = await db.query(
+    `SELECT * FROM orders WHERE event_id = $1 AND status IN ('paid', 'partially_refunded')`,
+    [event.id]
+  );
+  const notifyMap = new Map(); // userId -> refundInitiated
+  for (const t of invalidatedTickets) notifyMap.set(t.owner_user_id, false);
+
+  let refundsCreated = 0;
+  for (const order of refundableOrders) {
+    const remaining = order.total_cents - order.refunded_cents;
+    if (remaining <= 0) continue;
+    const existing = await db.query(`SELECT id FROM refunds WHERE order_id = $1 AND status = 'requested'`, [order.id]);
+    if (existing.length > 0) continue;
+    await db.query(
+      `INSERT INTO refunds (order_id, requested_by_user_id, amount_cents, reason) VALUES ($1, $2, $3, $4)`,
+      [order.id, order.user_id, remaining, `Event cancelled by organizer${reason ? `: ${reason}` : ''}`]
+    );
+    refundsCreated++;
+    notifyMap.set(order.user_id, true);
+  }
+
+  for (const [userId, refundInitiated] of notifyMap) {
+    await notify(userId, 'event.cancelled', { eventName: event.name, reason, refundInitiated }, ['in_app', 'email']);
+  }
+
+  await audit(req.user.sub, 'event.cancelled', 'event', event.id, {
+    reason,
+    ticketsInvalidated: invalidatedTickets.length,
+    refundsCreated,
+  });
+
+  res.json({ message: 'Event cancelled', ticketsInvalidated: invalidatedTickets.length, refundsCreated });
+});
+
+router.post('/events/:id/postpone', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (event.status === 'cancelled') return res.status(400).json({ error: 'Cannot postpone a cancelled event' });
+
+  const { newStartsAt, reason } = req.body || {};
+  const parsed = newStartsAt ? new Date(newStartsAt) : null;
+  if (!parsed || Number.isNaN(parsed.getTime())) {
+    return res.status(400).json({ error: 'newStartsAt must be a valid date' });
+  }
+
+  const oldStartsAt = event.starts_at;
+  const updated = await db.one(
+    `UPDATE events
+     SET starts_at = $1, postponed_at = now(), original_starts_at = COALESCE(original_starts_at, starts_at), postpone_reason = $2
+     WHERE id = $3 RETURNING *`,
+    [parsed.toISOString(), reason || null, event.id]
+  );
+
+  // Only ticket holders with a still-valid ticket need to hear about this —
+  // someone whose ticket was already invalidated/refunded has nothing riding
+  // on the new date.
+  const ticketHolders = await db.query(
+    `SELECT DISTINCT owner_user_id FROM tickets WHERE event_id = $1 AND status = 'valid'`,
+    [event.id]
+  );
+  for (const row of ticketHolders) {
+    await notify(
+      row.owner_user_id,
+      'event.postponed',
+      { eventName: event.name, oldStartsAt, newStartsAt: updated.starts_at, reason },
+      ['in_app', 'email']
+    );
+  }
+
+  await audit(req.user.sub, 'event.postponed', 'event', event.id, { reason, oldStartsAt, newStartsAt: updated.starts_at });
+  res.json({ event: updated, notified: ticketHolders.length });
+});
+
+// ===================== EVENT COVER IMAGE =====================
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: imageStorage.MAX_BYTES },
+  fileFilter: (req, file, cb) => {
+    if (!imageStorage.isAllowedMime(file.mimetype)) {
+      return cb(Object.assign(new Error('Unsupported image type — use JPEG, PNG, or WebP'), { status: 400 }));
+    }
+    cb(null, true);
+  },
+});
+
+// Wraps multer so its errors (wrong type, too large) come back as a clean
+// 400 instead of falling through to the generic 500 error handler.
+function handleImageUpload(req, res, next) {
+  upload.single('image')(req, res, (err) => {
+    if (err) {
+      const message = err.code === 'LIMIT_FILE_SIZE' ? 'Image is too large — max 5MB' : err.message;
+      return res.status(err.status || 400).json({ error: message });
+    }
+    next();
+  });
+}
+
+router.post('/events/:id/image', requireAuth, requireRole('organizer_owner'), handleImageUpload, async (req, res) => {
+  const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (!req.file) return res.status(400).json({ error: 'image file is required (multipart field "image")' });
+
+  let saved;
+  try {
+    saved = imageStorage.saveEventImage(event.id, req.file.buffer, req.file.mimetype);
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message });
+  }
+
+  const previousUrl = event.image_url;
+  await db.query('UPDATE events SET image_url = $1 WHERE id = $2', [saved.url, event.id]);
+  if (previousUrl) imageStorage.deleteEventImage(previousUrl);
+
+  await audit(req.user.sub, 'event.image_uploaded', 'event', event.id, {});
+  res.status(201).json({ imageUrl: saved.url });
+});
+
+router.delete('/events/:id/image', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
+  if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (!event.image_url) return res.status(400).json({ error: 'This event has no image to remove' });
+
+  imageStorage.deleteEventImage(event.image_url);
+  await db.query('UPDATE events SET image_url = NULL WHERE id = $1', [event.id]);
+  await audit(req.user.sub, 'event.image_removed', 'event', event.id, {});
+  res.json({ message: 'Image removed' });
 });
 
 module.exports = router;

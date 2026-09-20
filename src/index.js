@@ -1,5 +1,6 @@
 // src/index.js
 require('dotenv').config();
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -31,6 +32,19 @@ app.use(helmet());
 app.use(cors());
 app.use(generalLimiter);
 
+// Uploaded event cover images (see utils/imageStorage.js) — served publicly
+// so they can be embedded anywhere (a listing card, a frontend on another
+// origin). Helmet's default same-origin resource policy would otherwise
+// block exactly that, so it's relaxed just for this one static path.
+app.use(
+  '/uploads',
+  (req, res, next) => {
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    next();
+  },
+  express.static(path.join(__dirname, '..', 'uploads'))
+);
+
 // The payment webhooks need the exact raw request bytes to verify their HMAC
 // signature, so these exact paths get the raw body parser, and the global
 // JSON parser explicitly skips them (chaining both on one path would try to
@@ -53,6 +67,11 @@ app.get('/api/config', (req, res) => res.json({ stripePublishableKey: process.en
 
 app.use('/api/auth/register', authLimiter);
 app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/mfa/verify', authLimiter);
+app.use('/api/auth/forgot-password', authLimiter);
+app.use('/api/auth/reset-password', authLimiter);
+app.use('/api/auth/verify-email', authLimiter);
+app.use('/api/auth/verify-phone', authLimiter);
 
 app.use('/api/auth', authRoutes);
 app.use('/api/events', eventRoutes);

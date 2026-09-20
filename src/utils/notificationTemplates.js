@@ -72,6 +72,38 @@ const TEMPLATES = {
     subject: 'AfroTickets refund is being processed manually',
     body: `Your refund for order #${p.orderId} was approved and is being processed manually by our team since it was paid via M-Pesa — you'll be notified once it completes.`,
   }),
+  'auth.email_verification': (p) => ({
+    subject: 'Verify your AfroTickets email',
+    body: `Welcome to AfroTickets! Verify your email with this code: ${p.token}${p.verifyUrl ? `\nOr open: ${p.verifyUrl}` : ''}\nThis code expires in 24 hours.`,
+  }),
+  'auth.phone_verification': (p) => ({
+    subject: 'Your AfroTickets verification code',
+    body: `Your AfroTickets verification code is ${p.code}. It expires in 10 minutes.`,
+  }),
+  'auth.password_reset': (p) => ({
+    subject: 'Reset your AfroTickets password',
+    body: `Use this code to reset your AfroTickets password: ${p.token}${p.resetUrl ? `\nOr open: ${p.resetUrl}` : ''}\nThis code expires in 1 hour. If you didn't request this, you can safely ignore this message.`,
+  }),
+  'auth.password_changed': () => ({
+    subject: 'Your AfroTickets password was changed',
+    body: "Your AfroTickets password was just changed. If this wasn't you, contact support immediately — all other sessions have been signed out.",
+  }),
+  'auth.mfa_enabled': () => ({
+    subject: 'Two-factor authentication enabled',
+    body: 'Two-factor authentication was just enabled on your AfroTickets account. Keep your backup codes somewhere safe — each one only works once.',
+  }),
+  'event.cancelled': (p) => ({
+    subject: 'An AfroTickets event was cancelled',
+    body: `"${p.eventName}" has been cancelled${p.reason ? `: ${p.reason}` : '.'} ${p.refundInitiated ? 'A refund has been requested on your behalf and is pending review.' : ''}`.trim(),
+  }),
+  'event.postponed': (p) => ({
+    subject: 'An AfroTickets event was rescheduled',
+    body: `"${p.eventName}" has been rescheduled from ${p.oldStartsAt} to ${p.newStartsAt}${p.reason ? `: ${p.reason}` : '.'} Your ticket is still valid for the new date.`,
+  }),
+  'auth.mfa_disabled': () => ({
+    subject: 'Two-factor authentication disabled',
+    body: "Two-factor authentication was just turned off on your AfroTickets account. If this wasn't you, contact support immediately.",
+  }),
 };
 
 function renderNotification(type, payload) {

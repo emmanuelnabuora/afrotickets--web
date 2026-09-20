@@ -135,6 +135,62 @@ CREATE TABLE IF NOT EXISTS refunds (
   completed_at TIMESTAMPTZ
 );
 
+-- ===================== ACCOUNT ACCESS & SECURITY =====================
+-- Sessions are tracked explicitly (rather than trusting a bare stateless
+-- JWT) so a session can actually be revoked before its 7-day expiry —
+-- logout, "sign out other devices", and a forced sign-out after a password
+-- reset all depend on a row existing here to flip revoked_at on.
+CREATE TABLE IF NOT EXISTS sessions (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  user_agent TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  last_seen_at TIMESTAMPTZ DEFAULT now(),
+  revoked_at TIMESTAMPTZ
+);
+
+-- Tokens are never stored raw — only their sha256 hash — so a leaked
+-- database dump can't be used to verify anyone's email or reset a password.
+CREATE TABLE IF NOT EXISTS email_verifications (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  token_hash TEXT UNIQUE NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS phone_verifications (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  code_hash TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS password_resets (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  token_hash TEXT UNIQUE NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- One-time recovery codes for a user who's enabled TOTP MFA and lost their
+-- authenticator device. Only hashes are stored; the plaintext codes are
+-- shown exactly once, at the moment MFA is enabled.
+CREATE TABLE IF NOT EXISTS mfa_backup_codes (
+  id SERIAL PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  code_hash TEXT NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS resale_listings (
   id SERIAL PRIMARY KEY,
   ticket_id INTEGER,
@@ -265,6 +321,17 @@ CREATE TABLE IF NOT EXISTS fraud_signals (
   await pool.query(`ALTER TABLE notifications ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT;`);
   await pool.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS refunded_cents INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_secret TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_pending_secret TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS mfa_enabled_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS image_url TEXT;`);
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS cancellation_reason TEXT;`);
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS postponed_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS original_starts_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS postpone_reason TEXT;`);
 }
 
 module.exports = { pool, query, one, withTransaction, migrate };

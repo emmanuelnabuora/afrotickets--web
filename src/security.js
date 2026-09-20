@@ -20,7 +20,10 @@ const generalLimiter = rateLimit({
 // real person mistyping their password a few times never hits it.
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  // Overridable only for local/test runs that need to exercise many auth
+  // flows back-to-back (e.g. a test script logging in dozens of times) —
+  // defaults to the real production-sized budget otherwise.
+  max: Number(process.env.AUTH_RATE_LIMIT_MAX) || 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many login attempts — please wait 15 minutes and try again.' },
