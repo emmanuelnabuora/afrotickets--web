@@ -44,6 +44,14 @@ const TEMPLATES = {
     subject: 'AfroTickets organizer application update',
     body: `Your AfroTickets organizer application was not approved${p.reason ? `: ${p.reason}` : '.'}`,
   }),
+  'organizer.suspended': (p) => ({
+    subject: 'Your AfroTickets organizer account has been suspended',
+    body: `Your AfroTickets organizer account has been suspended${p.reason ? `: ${p.reason}` : '.'} Your existing events remain live, but you can't create or edit events until this is resolved. Contact support for details.`,
+  }),
+  'organizer.reactivated': () => ({
+    subject: 'Your AfroTickets organizer account has been reactivated',
+    body: 'Your AfroTickets organizer account is no longer suspended — you can create and edit events again.',
+  }),
   'event.published': () => ({
     subject: 'Your AfroTickets event is live',
     body: 'Your event has been approved and is now published on AfroTickets.',

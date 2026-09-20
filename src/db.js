@@ -362,6 +362,13 @@ CREATE TABLE IF NOT EXISTS payouts (
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS postpone_reason TEXT;`);
   await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS payouts_frozen_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS payouts_frozen_reason TEXT;`);
+  // Suspension is distinct from freezing payouts (payouts_frozen_* above,
+  // which only blocks money movement) and from rejection (a pre-approval
+  // decision). Suspension pauses an already-approved organizer's ability to
+  // keep building out their footprint — verification_status transitions to
+  // 'suspended' and back to 'approved' on reactivation; see routes/admin.js.
+  await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS suspension_reason TEXT;`);
 
   // ===================== AUDIT LOG IMMUTABILITY =====================
   // App-level convention ("nothing ever calls UPDATE/DELETE on audit_log")

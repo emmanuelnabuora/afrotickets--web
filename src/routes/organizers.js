@@ -29,6 +29,23 @@ async function getOwnedEventOrFail(userId, eventId) {
   return db.one('SELECT * FROM events WHERE id = $1 AND organizer_id = $2 AND deleted_at IS NULL', [eventId, organizer.id]);
 }
 
+// A suspended organizer (see admin.js's suspend/reactivate) can't build out
+// their footprint further — create events, edit them, add seats, or change
+// imagery — but deliberately CAN still cancel or postpone an existing event,
+// since those protect ticket holders (a customer shouldn't be stuck with a
+// dead event just because its organizer is under review) and read-only
+// endpoints (GET /me, /events/mine, analytics) stay open so a suspended
+// organizer can still see their own status and history.
+function blockIfSuspended(organizer, res) {
+  if (organizer.verification_status === 'suspended') {
+    res.status(403).json({
+      error: `Your organizer account is suspended${organizer.suspension_reason ? `: ${organizer.suspension_reason}` : ''} — contact support to resolve this before making further changes.`,
+    });
+    return true;
+  }
+  return false;
+}
+
 router.post('/onboard', requireAuth, requireRole('organizer_owner', 'platform_admin'), async (req, res) => {
   const { name, country, settlementMethod, settlementAccount } = req.body;
   if (!name || !country) return res.status(400).json({ error: 'name and country are required' });
@@ -55,6 +72,7 @@ router.get('/me', requireAuth, async (req, res) => {
 router.post('/events', requireAuth, requireRole('organizer_owner'), validateEventCreation, validateTicketTypeCreation, async (req, res) => {
   const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   if (!organizer) return res.status(400).json({ error: 'Complete organizer onboarding first' });
+  if (blockIfSuspended(organizer, res)) return;
 
   const { name, category, description, venue, city, country, startsAt, currency, ticketTypes } = req.body;
 
@@ -88,6 +106,7 @@ router.post('/events/:id/seats', requireAuth, requireRole('organizer_owner'), as
   const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   const event = await db.one('SELECT * FROM events WHERE id = $1 AND organizer_id = $2', [req.params.id, organizer?.id]);
   if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (blockIfSuspended(organizer, res)) return;
 
   const { ticketTypeId, sectionName, tier, rows, seatsPerRow } = req.body;
   const ticketType = await db.one('SELECT * FROM ticket_types WHERE id = $1 AND event_id = $2', [ticketTypeId, event.id]);
@@ -152,8 +171,10 @@ const EDITABLE_ALWAYS = { name: 'name', category: 'category', description: 'desc
 const EDITABLE_IF_UNSOLD = { venue: 'venue', city: 'city', country: 'country', currency: 'currency', startsAt: 'starts_at' };
 
 router.patch('/events/:id', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
   if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (blockIfSuspended(organizer, res)) return;
   if (event.status === 'cancelled') return res.status(400).json({ error: 'Cannot edit a cancelled event' });
 
   const soldRow = await db.one('SELECT COALESCE(SUM(quantity_sold),0) AS sold FROM ticket_types WHERE event_id = $1', [event.id]);
@@ -312,8 +333,10 @@ function handleImageUpload(req, res, next) {
 }
 
 router.post('/events/:id/image', requireAuth, requireRole('organizer_owner'), handleImageUpload, async (req, res) => {
+  const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
   if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (blockIfSuspended(organizer, res)) return;
   if (!req.file) return res.status(400).json({ error: 'image file is required (multipart field "image")' });
 
   let saved;
@@ -332,8 +355,10 @@ router.post('/events/:id/image', requireAuth, requireRole('organizer_owner'), ha
 });
 
 router.delete('/events/:id/image', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
   if (!event) return res.status(404).json({ error: 'Event not found' });
+  if (blockIfSuspended(organizer, res)) return;
   if (!event.image_url) return res.status(400).json({ error: 'This event has no image to remove' });
 
   imageStorage.deleteEventImage(event.image_url);

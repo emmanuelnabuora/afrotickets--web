@@ -35,6 +35,53 @@ router.post('/organizers/:id/reject', async (req, res) => {
   res.json({ message: 'Organizer rejected' });
 });
 
+// ===================== ORGANIZER SUSPENSION =====================
+// Distinct from reject: reject is a pre-approval decision on an organizer
+// who was never live. Suspension pauses an already-approved organizer —
+// e.g. a dispute pattern or a fraud signal worth investigating — without
+// deleting their account, their history, or unpublishing events already on
+// sale (an admin can still cancel a specific event separately if that's
+// warranted). It's also independent of payouts_frozen_at/reason above:
+// suspending an organizer does not automatically freeze their payouts, and
+// freezing payouts does not suspend them — freeze/unfreeze exists precisely
+// for the money-only case, so the two are decided separately.
+
+router.get('/organizers/suspended', async (req, res) => {
+  const rows = await db.query(`SELECT * FROM organizers WHERE verification_status = 'suspended'`);
+  const organizers = rows.map((o) => ({ ...o, settlement_account: pii.decrypt(o.settlement_account) }));
+  res.json({ organizers });
+});
+
+router.post('/organizers/:id/suspend', async (req, res) => {
+  const org = await db.one('SELECT * FROM organizers WHERE id = $1', [req.params.id]);
+  if (!org) return res.status(404).json({ error: 'Organizer not found' });
+  if (org.verification_status !== 'approved') {
+    return res.status(409).json({ error: `Only an approved organizer can be suspended — current status: ${org.verification_status}` });
+  }
+  await db.query(
+    `UPDATE organizers SET verification_status = 'suspended', suspended_at = now(), suspension_reason = $1 WHERE id = $2`,
+    [req.body?.reason || null, org.id]
+  );
+  await audit(req.user.sub, 'organizer.suspended', 'organizer', org.id, { reason: req.body?.reason });
+  await notify(org.owner_user_id, 'organizer.suspended', { organizerId: org.id, reason: req.body?.reason }, ['in_app', 'email']);
+  res.json({ message: 'Organizer suspended' });
+});
+
+router.post('/organizers/:id/reactivate', async (req, res) => {
+  const org = await db.one('SELECT * FROM organizers WHERE id = $1', [req.params.id]);
+  if (!org) return res.status(404).json({ error: 'Organizer not found' });
+  if (org.verification_status !== 'suspended') {
+    return res.status(409).json({ error: `Only a suspended organizer can be reactivated — current status: ${org.verification_status}` });
+  }
+  await db.query(
+    `UPDATE organizers SET verification_status = 'approved', suspended_at = NULL, suspension_reason = NULL WHERE id = $1`,
+    [org.id]
+  );
+  await audit(req.user.sub, 'organizer.reactivated', 'organizer', org.id, {});
+  await notify(org.owner_user_id, 'organizer.reactivated', { organizerId: org.id }, ['in_app', 'email']);
+  res.json({ message: 'Organizer reactivated' });
+});
+
 router.get('/events/pending', async (req, res) => {
   const rows = await db.query(
     `SELECT e.*, o.name AS organizer_name, o.verification_status AS organizer_status
