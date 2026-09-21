@@ -47,6 +47,53 @@ function blockIfSuspended(organizer, res) {
   return false;
 }
 
+// Bump this to force every organizer to re-accept — e.g. after a real terms
+// change — with no migration needed. An organizer whose agreement_version
+// doesn't match this exactly hasn't accepted the CURRENT terms, whether
+// they've never accepted anything or accepted an older version.
+const CURRENT_AGREEMENT_VERSION = '2026-09-v1';
+
+// Same enforcement shape and same call sites as blockIfSuspended — creating
+// or editing an event, generating seats, changing an event's image are all
+// gated on having agreed to the current organizer agreement, but cancel/
+// postpone and every read-only endpoint stay open, for the same reason
+// suspension leaves them open (protecting existing ticket holders shouldn't
+// depend on a paperwork step).
+function blockIfAgreementNotAccepted(organizer, res) {
+  if (organizer.agreement_version !== CURRENT_AGREEMENT_VERSION) {
+    res.status(403).json({
+      error: 'You must accept the current organizer agreement before doing this — see GET /organizer/agreement, then POST /organizer/agreement/accept.',
+      currentVersion: CURRENT_AGREEMENT_VERSION,
+    });
+    return true;
+  }
+  return false;
+}
+
+router.get('/agreement', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const organizer = await getOwnedOrganizerOrFail(req.user.sub);
+  res.json({
+    currentVersion: CURRENT_AGREEMENT_VERSION,
+    acceptedVersion: organizer?.agreement_version || null,
+    acceptedAt: organizer?.agreement_accepted_at || null,
+    accepted: organizer?.agreement_version === CURRENT_AGREEMENT_VERSION,
+  });
+});
+
+router.post('/agreement/accept', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const organizer = await getOwnedOrganizerOrFail(req.user.sub);
+  if (!organizer) return res.status(400).json({ error: 'Complete organizer onboarding first' });
+  if (organizer.agreement_version === CURRENT_AGREEMENT_VERSION) {
+    return res.json({ message: 'Already accepted the current organizer agreement', version: CURRENT_AGREEMENT_VERSION, acceptedAt: organizer.agreement_accepted_at });
+  }
+  const updated = await db.one(
+    `UPDATE organizers SET agreement_accepted_at = now(), agreement_version = $1 WHERE id = $2 RETURNING agreement_accepted_at, agreement_version`,
+    [CURRENT_AGREEMENT_VERSION, organizer.id]
+  );
+  await audit(req.user.sub, 'organizer.agreement_accepted', 'organizer', organizer.id, { version: CURRENT_AGREEMENT_VERSION });
+  res.status(201).json({ message: 'Organizer agreement accepted', version: updated.agreement_version, acceptedAt: updated.agreement_accepted_at });
+});
+
 router.post('/onboard', requireAuth, requireRole('organizer_owner', 'platform_admin'), async (req, res) => {
   const { name, country, settlementMethod, settlementAccount } = req.body;
   if (!name || !country) return res.status(400).json({ error: 'name and country are required' });
@@ -74,6 +121,7 @@ router.post('/events', requireAuth, requireRole('organizer_owner'), validateEven
   const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   if (!organizer) return res.status(400).json({ error: 'Complete organizer onboarding first' });
   if (blockIfSuspended(organizer, res)) return;
+  if (blockIfAgreementNotAccepted(organizer, res)) return;
 
   const { name, category, description, venue, city, country, startsAt, currency, ticketTypes, resaleEnabled } = req.body;
 
@@ -111,6 +159,7 @@ router.post('/events/:id/seats', requireAuth, requireRole('organizer_owner'), va
   const event = await db.one('SELECT * FROM events WHERE id = $1 AND organizer_id = $2', [req.params.id, organizer?.id]);
   if (!event) return res.status(404).json({ error: 'Event not found' });
   if (blockIfSuspended(organizer, res)) return;
+  if (blockIfAgreementNotAccepted(organizer, res)) return;
 
   const { ticketTypeId, sectionName, tier, rows, seatsPerRow } = req.body;
   const ticketType = await db.one('SELECT * FROM ticket_types WHERE id = $1 AND event_id = $2', [ticketTypeId, event.id]);
@@ -176,6 +225,7 @@ router.patch('/events/:id', requireAuth, requireRole('organizer_owner'), async (
   const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
   if (!event) return res.status(404).json({ error: 'Event not found' });
   if (blockIfSuspended(organizer, res)) return;
+  if (blockIfAgreementNotAccepted(organizer, res)) return;
   if (event.status === 'cancelled') return res.status(400).json({ error: 'Cannot edit a cancelled event' });
 
   const soldRow = await db.one('SELECT COALESCE(SUM(quantity_sold),0) AS sold FROM ticket_types WHERE event_id = $1', [event.id]);
@@ -344,6 +394,7 @@ router.post('/events/:id/image', requireAuth, requireRole('organizer_owner'), ha
   const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
   if (!event) return res.status(404).json({ error: 'Event not found' });
   if (blockIfSuspended(organizer, res)) return;
+  if (blockIfAgreementNotAccepted(organizer, res)) return;
   if (!req.file) return res.status(400).json({ error: 'image file is required (multipart field "image")' });
 
   let saved;
@@ -366,6 +417,7 @@ router.delete('/events/:id/image', requireAuth, requireRole('organizer_owner'), 
   const event = await getOwnedEventOrFail(req.user.sub, req.params.id);
   if (!event) return res.status(404).json({ error: 'Event not found' });
   if (blockIfSuspended(organizer, res)) return;
+  if (blockIfAgreementNotAccepted(organizer, res)) return;
   if (!event.image_url) return res.status(400).json({ error: 'This event has no image to remove' });
 
   imageStorage.deleteEventImage(event.image_url);

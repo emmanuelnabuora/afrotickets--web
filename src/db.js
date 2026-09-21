@@ -401,6 +401,16 @@ CREATE TABLE IF NOT EXISTS payouts (
   // never returned to any API caller; the file itself is only reachable
   // through an authenticated download route (owner or admin), never
   // express.static, since these files can contain real PII.
+  // Versioned organizer agreement acceptance. NULL agreement_accepted_at (or
+  // an agreement_version older than CURRENT_AGREEMENT_VERSION in
+  // routes/organizers.js) means the organizer hasn't agreed to the current
+  // terms yet — enforced at the same points as blockIfSuspended (creating
+  // or editing an event, generating seats, changing an event's image).
+  // Bumping CURRENT_AGREEMENT_VERSION in code re-requires acceptance from
+  // every organizer without needing a migration.
+  await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS agreement_accepted_at TIMESTAMPTZ;`);
+  await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS agreement_version TEXT;`);
+
   await pool.query(`
 CREATE TABLE IF NOT EXISTS organizer_documents (
   id SERIAL PRIMARY KEY,
