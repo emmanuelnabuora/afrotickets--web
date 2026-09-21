@@ -461,4 +461,158 @@ router.post('/payouts/:id/approve', async (req, res) => {
   res.json({ message: `Payout ${result.status}`, payoutStatus: result.status });
 });
 
+// ===================== FINANCE RECONCILIATION =====================
+// The raw ledger data (orders, payments, refunds, payouts) has always
+// existed — this is the first report/endpoint that actually reconciles it:
+// aggregates money moved on each side, AND cross-checks that what the
+// order table says was charged actually matches a real succeeded payment
+// record, which is the whole point of "reconciliation" rather than just a
+// sales summary. Platform-admin only — this spans every organizer.
+router.get('/finance/reconciliation', async (req, res) => {
+  const { from, to, currency } = req.query;
+  let fromDate = null;
+  let toDate = null;
+  if (from !== undefined) {
+    fromDate = new Date(from);
+    if (Number.isNaN(fromDate.getTime())) return res.status(400).json({ error: 'from must be a valid date' });
+  }
+  if (to !== undefined) {
+    toDate = new Date(to);
+    if (Number.isNaN(toDate.getTime())) return res.status(400).json({ error: 'to must be a valid date' });
+  }
+  if (currency !== undefined && (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency))) {
+    return res.status(400).json({ error: 'currency must be a 3-letter ISO code (e.g. USD, KES)' });
+  }
+
+  // Each aggregate filters on its OWN created_at — a payment, refund, or
+  // payout can land days or weeks after the order that started it — because
+  // a finance reconciliation for "what happened in this window" needs to
+  // count money that actually moved in the window, not orders opened in it.
+  function rangeAndCurrencyClause(params, dateColumn, currencyColumn) {
+    const clauses = [];
+    if (fromDate) {
+      params.push(fromDate.toISOString());
+      clauses.push(`${dateColumn} >= $${params.length}`);
+    }
+    if (toDate) {
+      params.push(toDate.toISOString());
+      clauses.push(`${dateColumn} <= $${params.length}`);
+    }
+    if (currency) {
+      params.push(currency);
+      clauses.push(`${currencyColumn} = $${params.length}`);
+    }
+    return clauses.length ? ' AND ' + clauses.join(' AND ') : '';
+  }
+
+  // ---- Sales (orders that actually collected money) ----
+  const salesParams = [];
+  const salesClause = rangeAndCurrencyClause(salesParams, 'o.created_at', 'o.currency');
+  const sales = await db.query(
+    `SELECT o.currency, COUNT(*) AS order_count,
+            COALESCE(SUM(o.subtotal_cents),0) AS subtotal_cents,
+            COALESCE(SUM(o.fee_cents),0) AS fee_cents,
+            COALESCE(SUM(o.tax_cents),0) AS tax_cents,
+            COALESCE(SUM(o.total_cents),0) AS total_cents,
+            COALESCE(SUM(o.refunded_cents),0) AS refunded_cents
+     FROM orders o
+     WHERE o.status IN ('paid', 'partially_refunded')${salesClause}
+     GROUP BY o.currency
+     ORDER BY o.currency`,
+    salesParams
+  );
+
+  // ---- Payments (currency comes via whichever of orders/resale_orders it settled) ----
+  const paymentsParams = [];
+  const paymentsClause = rangeAndCurrencyClause(paymentsParams, 'p.created_at', 'COALESCE(o.currency, ro.currency)');
+  const payments = await db.query(
+    `SELECT p.provider, p.status, COALESCE(o.currency, ro.currency) AS currency,
+            COUNT(*) AS count, COALESCE(SUM(p.amount_cents),0) AS amount_cents
+     FROM payments p
+     LEFT JOIN orders o ON o.id = p.order_id
+     LEFT JOIN resale_orders ro ON ro.id = p.resale_order_id
+     WHERE 1=1${paymentsClause}
+     GROUP BY p.provider, p.status, COALESCE(o.currency, ro.currency)
+     ORDER BY p.provider, p.status`,
+    paymentsParams
+  );
+
+  // ---- Refunds ----
+  const refundsParams = [];
+  const refundsClause = rangeAndCurrencyClause(refundsParams, 'r.created_at', 'o.currency');
+  const refunds = await db.query(
+    `SELECT r.status, o.currency, COUNT(*) AS count, COALESCE(SUM(r.amount_cents),0) AS amount_cents
+     FROM refunds r
+     JOIN orders o ON o.id = r.order_id
+     WHERE 1=1${refundsClause}
+     GROUP BY r.status, o.currency
+     ORDER BY r.status`,
+    refundsParams
+  );
+
+  // ---- Payouts ----
+  const payoutsParams = [];
+  const payoutsClause = rangeAndCurrencyClause(payoutsParams, 'po.created_at', 'e.currency');
+  const payouts = await db.query(
+    `SELECT po.status, e.currency, COUNT(*) AS count, COALESCE(SUM(po.amount_cents),0) AS amount_cents
+     FROM payouts po
+     JOIN events e ON e.id = po.event_id
+     WHERE 1=1${payoutsClause}
+     GROUP BY po.status, e.currency
+     ORDER BY po.status`,
+    payoutsParams
+  );
+
+  // ---- Discrepancy 1: an order marked paid/partially_refunded with no
+  // succeeded payment on file at all — should never happen, and if it does
+  // it means either the ledger or the payment record is wrong.
+  const missingParams = [];
+  const missingClause = rangeAndCurrencyClause(missingParams, 'o.created_at', 'o.currency');
+  const ordersMissingSucceededPayment = await db.query(
+    `SELECT o.id AS order_id, o.status, o.currency, o.total_cents, o.created_at
+     FROM orders o
+     WHERE o.status IN ('paid', 'partially_refunded')
+       AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.order_id = o.id AND p.status = 'succeeded')
+       ${missingClause}
+     ORDER BY o.created_at DESC`,
+    missingParams
+  );
+
+  // ---- Discrepancy 2: an order's succeeded-payment total doesn't match
+  // what the order says it charged — the amount actually collected and the
+  // amount on the ledger have drifted apart.
+  const mismatchParams = [];
+  const mismatchClause = rangeAndCurrencyClause(mismatchParams, 'o.created_at', 'o.currency');
+  const ordersPaymentMismatch = await db.query(
+    `SELECT o.id AS order_id, o.status, o.currency, o.total_cents,
+            COALESCE(SUM(p.amount_cents), 0) AS succeeded_payment_cents
+     FROM orders o
+     LEFT JOIN payments p ON p.order_id = o.id AND p.status = 'succeeded'
+     WHERE o.status IN ('paid', 'partially_refunded')
+       ${mismatchClause}
+     GROUP BY o.id, o.status, o.currency, o.total_cents
+     HAVING COALESCE(SUM(p.amount_cents), 0) != o.total_cents
+     ORDER BY o.id`,
+    mismatchParams
+  );
+
+  const toNumbers = (rows, fields) => rows.map((r) => {
+    const out = { ...r };
+    for (const f of fields) out[f] = Number(out[f]);
+    return out;
+  });
+
+  res.json({
+    range: { from: fromDate ? fromDate.toISOString() : null, to: toDate ? toDate.toISOString() : null, currency: currency || null },
+    sales: { byCurrency: toNumbers(sales, ['order_count', 'subtotal_cents', 'fee_cents', 'tax_cents', 'total_cents', 'refunded_cents']) },
+    payments: { byProviderStatusCurrency: toNumbers(payments, ['count', 'amount_cents']) },
+    refunds: { byStatusCurrency: toNumbers(refunds, ['count', 'amount_cents']) },
+    payouts: { byStatusCurrency: toNumbers(payouts, ['count', 'amount_cents']) },
+    discrepancies: {
+      ordersMissingSucceededPayment: toNumbers(ordersMissingSucceededPayment, ['total_cents']),
+      ordersPaymentMismatch: toNumbers(ordersPaymentMismatch, ['total_cents', 'succeeded_payment_cents']),
+    },
+  });
+});
+
 module.exports = router;
