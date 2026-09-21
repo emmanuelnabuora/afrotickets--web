@@ -6,6 +6,7 @@ const { requireAuth, requireRole } = require('../auth');
 const { audit } = require('../utils/audit');
 const { notify } = require('../utils/notify');
 const imageStorage = require('../utils/imageStorage');
+const documentStorage = require('../utils/organizerDocumentStorage');
 const pii = require('../utils/piiCrypto');
 const { validateEventCreation, validateTicketTypeCreation, validateSeatGeneration } = require('../security');
 
@@ -371,6 +372,89 @@ router.delete('/events/:id/image', requireAuth, requireRole('organizer_owner'), 
   await db.query('UPDATE events SET image_url = NULL WHERE id = $1', [event.id]);
   await audit(req.user.sub, 'event.image_removed', 'event', event.id, {});
   res.json({ message: 'Image removed' });
+});
+
+// ===================== IDENTITY / BUSINESS DOCUMENTS =====================
+// Submitted for a platform admin to review (see routes/admin.js). Uploading
+// or listing documents is intentionally NOT blocked by blockIfSuspended —
+// resolving a suspension is exactly the kind of thing an organizer may need
+// to submit a document for, so gating this the same way as event edits
+// would work against its own purpose.
+
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: documentStorage.MAX_BYTES },
+  fileFilter: (req, file, cb) => {
+    if (!documentStorage.isAllowedMime(file.mimetype)) {
+      return cb(Object.assign(new Error('Unsupported file type — use JPEG, PNG, WebP, or PDF'), { status: 400 }));
+    }
+    cb(null, true);
+  },
+});
+
+function handleDocumentUpload(req, res, next) {
+  documentUpload.single('document')(req, res, (err) => {
+    if (err) {
+      const message = err.code === 'LIMIT_FILE_SIZE' ? 'File is too large — max 10MB' : err.message;
+      return res.status(err.status || 400).json({ error: message });
+    }
+    next();
+  });
+}
+
+// Metadata only — never the storage_path, which is an internal filesystem
+// detail no API response should ever leak.
+function decorateDocument(doc) {
+  const { storage_path, ...rest } = doc;
+  return rest;
+}
+
+router.post('/documents', requireAuth, requireRole('organizer_owner'), handleDocumentUpload, async (req, res) => {
+  const organizer = await getOwnedOrganizerOrFail(req.user.sub);
+  if (!organizer) return res.status(400).json({ error: 'Complete organizer onboarding first' });
+  if (!req.file) return res.status(400).json({ error: 'document file is required (multipart field "document")' });
+  const { documentType } = req.body;
+  if (!documentStorage.isAllowedDocumentType(documentType)) {
+    return res.status(400).json({ error: `documentType must be one of: ${[...documentStorage.DOCUMENT_TYPES].join(', ')}` });
+  }
+
+  let saved;
+  try {
+    saved = documentStorage.saveDocument(organizer.id, req.file.buffer, req.file.mimetype);
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: err.message });
+  }
+
+  const created = await db.one(
+    `INSERT INTO organizer_documents (organizer_id, document_type, original_filename, mime_type, storage_path)
+     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    [organizer.id, documentType, req.file.originalname || null, req.file.mimetype, saved.storagePath]
+  );
+
+  await audit(req.user.sub, 'organizer.document_uploaded', 'organizer', organizer.id, { documentType, documentId: created.id });
+  res.status(201).json({ document: decorateDocument(created) });
+});
+
+router.get('/documents', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const organizer = await getOwnedOrganizerOrFail(req.user.sub);
+  if (!organizer) return res.json({ documents: [] });
+  const rows = await db.query('SELECT * FROM organizer_documents WHERE organizer_id = $1 ORDER BY uploaded_at DESC', [organizer.id]);
+  res.json({ documents: rows.map(decorateDocument) });
+});
+
+router.get('/documents/:id/file', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+  const organizer = await getOwnedOrganizerOrFail(req.user.sub);
+  const doc = await db.one('SELECT * FROM organizer_documents WHERE id = $1 AND organizer_id = $2', [req.params.id, organizer?.id]);
+  if (!doc) return res.status(404).json({ error: 'Document not found' });
+  let buffer;
+  try {
+    buffer = documentStorage.readDocument(doc.storage_path);
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: 'Could not read document', detail: err.message });
+  }
+  res.setHeader('Content-Type', doc.mime_type);
+  res.setHeader('Content-Disposition', `inline; filename="${doc.original_filename || 'document'}"`);
+  res.send(buffer);
 });
 
 module.exports = router;

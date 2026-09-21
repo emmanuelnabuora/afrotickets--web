@@ -5,15 +5,32 @@ const { requireAuth, requireRole } = require('../auth');
 const { audit } = require('../utils/audit');
 const { notify } = require('../utils/notify');
 const pii = require('../utils/piiCrypto');
+const documentStorage = require('../utils/organizerDocumentStorage');
 
 const router = express.Router();
 router.use(requireAuth, requireRole('platform_admin'));
+
+// Attaches a lightweight per-organizer document summary (count + how many
+// are still pending review) to a listing of organizers, so an admin can see
+// at a glance whether there's anything to review without a separate request
+// per organizer. Metadata only — never storage_path.
+async function attachDocumentSummary(organizers) {
+  for (const o of organizers) {
+    const docs = await db.query(
+      'SELECT id, document_type, status, original_filename, uploaded_at FROM organizer_documents WHERE organizer_id = $1 ORDER BY uploaded_at DESC',
+      [o.id]
+    );
+    o.documents = docs;
+  }
+  return organizers;
+}
 
 router.get('/organizers/pending', async (req, res) => {
   const rows = await db.query(`SELECT * FROM organizers WHERE verification_status = 'pending'`);
   // settlement_account is stored encrypted (utils/piiCrypto.js) — a platform
   // admin reviewing onboarding is the one legitimate place to decrypt it.
   const organizers = rows.map((o) => ({ ...o, settlement_account: pii.decrypt(o.settlement_account) }));
+  await attachDocumentSummary(organizers);
   res.json({ organizers });
 });
 
@@ -80,6 +97,68 @@ router.post('/organizers/:id/reactivate', async (req, res) => {
   await audit(req.user.sub, 'organizer.reactivated', 'organizer', org.id, {});
   await notify(org.owner_user_id, 'organizer.reactivated', { organizerId: org.id }, ['in_app', 'email']);
   res.json({ message: 'Organizer reactivated' });
+});
+
+// ===================== ORGANIZER IDENTITY/BUSINESS DOCUMENTS =====================
+// Reviewing a document is a separate decision from approving/rejecting the
+// organizer overall (verification_status) — an admin still makes that call
+// independently, using the document review as one input among others. This
+// deliberately doesn't auto-gate organizer approval on document status.
+
+router.get('/organizers/:id/documents', async (req, res) => {
+  const org = await db.one('SELECT id FROM organizers WHERE id = $1', [req.params.id]);
+  if (!org) return res.status(404).json({ error: 'Organizer not found' });
+  const rows = await db.query(
+    'SELECT id, document_type, original_filename, mime_type, status, rejection_reason, uploaded_at, reviewed_at, reviewed_by_user_id FROM organizer_documents WHERE organizer_id = $1 ORDER BY uploaded_at DESC',
+    [org.id]
+  );
+  res.json({ documents: rows });
+});
+
+router.get('/organizers/:id/documents/:docId/file', async (req, res) => {
+  const doc = await db.one('SELECT * FROM organizer_documents WHERE id = $1 AND organizer_id = $2', [req.params.docId, req.params.id]);
+  if (!doc) return res.status(404).json({ error: 'Document not found' });
+  let buffer;
+  try {
+    buffer = documentStorage.readDocument(doc.storage_path);
+  } catch (err) {
+    return res.status(err.status || 500).json({ error: 'Could not read document', detail: err.message });
+  }
+  res.setHeader('Content-Type', doc.mime_type);
+  res.setHeader('Content-Disposition', `inline; filename="${doc.original_filename || 'document'}"`);
+  res.send(buffer);
+});
+
+router.post('/organizers/:id/documents/:docId/approve', async (req, res) => {
+  const doc = await db.one('SELECT * FROM organizer_documents WHERE id = $1 AND organizer_id = $2', [req.params.docId, req.params.id]);
+  if (!doc) return res.status(404).json({ error: 'Document not found' });
+  if (doc.status !== 'pending') {
+    return res.status(409).json({ error: `This document was already reviewed — current status: ${doc.status}` });
+  }
+  await db.query(
+    `UPDATE organizer_documents SET status = 'approved', reviewed_at = now(), reviewed_by_user_id = $1 WHERE id = $2`,
+    [req.user.sub, doc.id]
+  );
+  const org = await db.one('SELECT * FROM organizers WHERE id = $1', [doc.organizer_id]);
+  await audit(req.user.sub, 'organizer.document_approved', 'organizer', org.id, { documentId: doc.id, documentType: doc.document_type });
+  await notify(org.owner_user_id, 'organizer.document_approved', { documentType: doc.document_type }, ['in_app', 'email']);
+  res.json({ message: 'Document approved' });
+});
+
+router.post('/organizers/:id/documents/:docId/reject', async (req, res) => {
+  const doc = await db.one('SELECT * FROM organizer_documents WHERE id = $1 AND organizer_id = $2', [req.params.docId, req.params.id]);
+  if (!doc) return res.status(404).json({ error: 'Document not found' });
+  if (doc.status !== 'pending') {
+    return res.status(409).json({ error: `This document was already reviewed — current status: ${doc.status}` });
+  }
+  await db.query(
+    `UPDATE organizer_documents SET status = 'rejected', rejection_reason = $1, reviewed_at = now(), reviewed_by_user_id = $2 WHERE id = $3`,
+    [req.body?.reason || null, req.user.sub, doc.id]
+  );
+  const org = await db.one('SELECT * FROM organizers WHERE id = $1', [doc.organizer_id]);
+  await audit(req.user.sub, 'organizer.document_rejected', 'organizer', org.id, { documentId: doc.id, documentType: doc.document_type, reason: req.body?.reason });
+  await notify(org.owner_user_id, 'organizer.document_rejected', { documentType: doc.document_type, reason: req.body?.reason }, ['in_app', 'email']);
+  res.json({ message: 'Document rejected' });
 });
 
 router.get('/events/pending', async (req, res) => {

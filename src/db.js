@@ -393,6 +393,30 @@ CREATE TABLE IF NOT EXISTS payouts (
   // 'resale' explicitly on the replacement ticket it mints after a sale.
   await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'primary';`);
 
+  // ===================== ORGANIZER IDENTITY/BUSINESS DOCUMENTS =====================
+  // Supporting documents an organizer submits during onboarding (ID scan,
+  // business registration, etc.) for a platform admin to review — separate
+  // from the overall organizer verification_status, which an admin still
+  // decides independently. storage_path is an internal filesystem path,
+  // never returned to any API caller; the file itself is only reachable
+  // through an authenticated download route (owner or admin), never
+  // express.static, since these files can contain real PII.
+  await pool.query(`
+CREATE TABLE IF NOT EXISTS organizer_documents (
+  id SERIAL PRIMARY KEY,
+  organizer_id INTEGER NOT NULL REFERENCES organizers(id),
+  document_type TEXT NOT NULL,
+  original_filename TEXT,
+  mime_type TEXT NOT NULL,
+  storage_path TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  rejection_reason TEXT,
+  uploaded_at TIMESTAMPTZ DEFAULT now(),
+  reviewed_at TIMESTAMPTZ,
+  reviewed_by_user_id INTEGER REFERENCES users(id)
+);
+  `);
+
   // ===================== AUDIT LOG IMMUTABILITY =====================
   // App-level convention ("nothing ever calls UPDATE/DELETE on audit_log")
   // isn't a real guarantee — a bug, a bad migration, or a compromised

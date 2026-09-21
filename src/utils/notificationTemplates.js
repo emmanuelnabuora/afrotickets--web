@@ -52,6 +52,14 @@ const TEMPLATES = {
     subject: 'Your AfroTickets organizer account has been reactivated',
     body: 'Your AfroTickets organizer account is no longer suspended — you can create and edit events again.',
   }),
+  'organizer.document_approved': (p) => ({
+    subject: 'A document you submitted has been approved',
+    body: `Your ${p.documentType ? p.documentType.replace('_', ' ') : ''} document has been reviewed and approved.`.replace(/\s+/g, ' ').trim(),
+  }),
+  'organizer.document_rejected': (p) => ({
+    subject: 'A document you submitted needs attention',
+    body: `Your ${p.documentType ? p.documentType.replace('_', ' ') : ''} document was not approved${p.reason ? `: ${p.reason}` : '.'} Please submit a corrected copy.`.replace(/\s+/g, ' ').trim(),
+  }),
   'event.published': () => ({
     subject: 'Your AfroTickets event is live',
     body: 'Your event has been approved and is now published on AfroTickets.',
