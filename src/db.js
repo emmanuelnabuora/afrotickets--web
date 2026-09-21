@@ -369,6 +369,17 @@ CREATE TABLE IF NOT EXISTS payouts (
   // 'suspended' and back to 'approved' on reactivation; see routes/admin.js.
   await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS suspended_at TIMESTAMPTZ;`);
   await pool.query(`ALTER TABLE organizers ADD COLUMN IF NOT EXISTS suspension_reason TEXT;`);
+  // Per-event resale opt-out. NULL (the default) matches today's behavior —
+  // resale globally available on any valid ticket. A non-null timestamp
+  // means an organizer turned resale off for this event going forward; it
+  // never retroactively cancels listings already active (see routes/resale.js).
+  await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS resale_disabled_at TIMESTAMPTZ;`);
+  // Labels whether a ticket came from the original sale or from a resale
+  // purchase — previously invisible in the data model and API responses.
+  // Defaults to 'primary' so every ticket ever minted before this migration
+  // is correctly labeled with no backfill needed; routes/resale.js sets
+  // 'resale' explicitly on the replacement ticket it mints after a sale.
+  await pool.query(`ALTER TABLE tickets ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'primary';`);
 
   // ===================== AUDIT LOG IMMUTABILITY =====================
   // App-level convention ("nothing ever calls UPDATE/DELETE on audit_log")

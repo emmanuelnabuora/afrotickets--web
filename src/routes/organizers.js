@@ -74,12 +74,15 @@ router.post('/events', requireAuth, requireRole('organizer_owner'), validateEven
   if (!organizer) return res.status(400).json({ error: 'Complete organizer onboarding first' });
   if (blockIfSuspended(organizer, res)) return;
 
-  const { name, category, description, venue, city, country, startsAt, currency, ticketTypes } = req.body;
+  const { name, category, description, venue, city, country, startsAt, currency, ticketTypes, resaleEnabled } = req.body;
 
+  // resaleEnabled defaults to true (matches pre-existing behavior — resale
+  // was always globally available); explicitly passing false opts this
+  // event out of resale from the moment it's created.
   const event = await db.one(
-    `INSERT INTO events (organizer_id, name, category, description, venue, city, country, starts_at, currency, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending_review') RETURNING *`,
-    [organizer.id, name, category, description || '', venue || '', city || '', country || '', startsAt, currency || 'USD']
+    `INSERT INTO events (organizer_id, name, category, description, venue, city, country, starts_at, currency, status, resale_disabled_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending_review', $10) RETURNING *`,
+    [organizer.id, name, category, description || '', venue || '', city || '', country || '', startsAt, currency || 'USD', resaleEnabled === false ? new Date().toISOString() : null]
   );
 
   const types = [];
@@ -194,6 +197,12 @@ router.patch('/events/:id', requireAuth, requireRole('organizer_owner'), async (
   if (blocked.length > 0) {
     const suffix = blocked.includes('startsAt') ? ' — use POST /events/:id/postpone to reschedule instead' : '';
     return res.status(400).json({ error: `Cannot change ${blocked.join(', ')} once tickets have been sold${suffix}` });
+  }
+  // Toggling resale never affects a ticket holder's expectations (it only
+  // gates NEW listings going forward — see routes/resale.js), so it's
+  // editable at any time, sold-out event or not.
+  if (typeof req.body.resaleEnabled === 'boolean') {
+    updates.resale_disabled_at = req.body.resaleEnabled ? null : new Date().toISOString();
   }
   if (Object.keys(updates).length === 0) {
     return res.status(400).json({ error: 'No editable fields provided' });

@@ -27,6 +27,14 @@ router.post('/list', requireAuth, async (req, res) => {
     return res.status(409).json({ error: `This ticket can't be listed — current status: ${ticket.status}` });
   }
 
+  // Per-event opt-out: only blocks a NEW listing going forward. It doesn't
+  // touch listings already active for this event, so a seller who listed
+  // before the organizer turned resale off isn't retroactively cancelled.
+  const event = await db.one('SELECT resale_disabled_at FROM events WHERE id = $1', [ticket.event_id]);
+  if (event?.resale_disabled_at) {
+    return res.status(403).json({ error: 'The organizer has disabled resale for this event' });
+  }
+
   const ticketType = await db.one('SELECT * FROM ticket_types WHERE id = $1', [ticket.ticket_type_id]);
   const priceCents = Math.round(price * 100);
   const capCents = ticketType.price_cents;
@@ -178,7 +186,7 @@ async function processResaleWebhookPayload(rawBody, signature) {
         ownerUserId: resaleOrder.buyer_user_id,
       });
       await tx.query(
-        `INSERT INTO tickets (order_id, ticket_type_id, event_id, owner_user_id, qr_jti, qr_token) VALUES ($1, $2, $3, $4, $5, $6)`,
+        `INSERT INTO tickets (order_id, ticket_type_id, event_id, owner_user_id, qr_jti, qr_token, origin) VALUES ($1, $2, $3, $4, $5, $6, 'resale')`,
         [oldTicket.order_id, oldTicket.ticket_type_id, oldTicket.event_id, resaleOrder.buyer_user_id, jti, token]
       );
 

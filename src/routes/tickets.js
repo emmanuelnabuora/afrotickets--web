@@ -26,6 +26,7 @@ router.get('/mine', requireAuth, async (req, res) => {
       return {
         id: t.id,
         status: t.status,
+        origin: t.origin,
         eventName: t.event_name,
         startsAt: t.starts_at,
         venue: t.venue,
