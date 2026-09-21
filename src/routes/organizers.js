@@ -8,7 +8,7 @@ const { notify } = require('../utils/notify');
 const imageStorage = require('../utils/imageStorage');
 const documentStorage = require('../utils/organizerDocumentStorage');
 const pii = require('../utils/piiCrypto');
-const { validateEventCreation, validateTicketTypeCreation, validateSeatGeneration } = require('../security');
+const { validateEventCreation, validateTicketTypeCreation, validateSeatGeneration, validateSettlementInfo } = require('../security');
 
 const router = express.Router();
 
@@ -94,7 +94,7 @@ router.post('/agreement/accept', requireAuth, requireRole('organizer_owner'), as
   res.status(201).json({ message: 'Organizer agreement accepted', version: updated.agreement_version, acceptedAt: updated.agreement_accepted_at });
 });
 
-router.post('/onboard', requireAuth, requireRole('organizer_owner', 'platform_admin'), async (req, res) => {
+router.post('/onboard', requireAuth, requireRole('organizer_owner', 'platform_admin'), validateSettlementInfo, async (req, res) => {
   const { name, country, settlementMethod, settlementAccount } = req.body;
   if (!name || !country) return res.status(400).json({ error: 'name and country are required' });
 

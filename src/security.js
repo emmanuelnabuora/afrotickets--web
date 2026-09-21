@@ -198,6 +198,59 @@ function validateSeatGeneration(req, res, next) {
   next();
 }
 
+// Settlement account verification (organizer onboarding — POST /organizer/onboard):
+// settlementMethod/settlementAccount were previously free-text with zero
+// validation, so an organizer could be onboarded with a settlement account
+// that's obvious garbage (blank, a sentence, a credit-card-shaped number)
+// and nobody would find out until a real payout tried to use it and failed.
+// This is format/logic validation ONLY — it confirms the value plausibly IS
+// an M-Pesa phone number or a bank account number, not that the account
+// actually exists or belongs to the organizer. Real ownership verification
+// (bank micro-deposits, or a service like Plaid) is a separate, larger piece
+// of work, deliberately out of scope here.
+const SETTLEMENT_METHODS = new Set(['mpesa', 'bank']);
+
+// Same phone shapes utils/mpesaProvider.js's normalizePhone accepts, kept as
+// an independent check here so this validator doesn't have to import a
+// Daraja-specific module just to test a shape.
+function isPlausibleKenyanPhone(value) {
+  const digits = String(value).replace(/\D/g, '');
+  if (digits.startsWith('254') && digits.length === 12) return true;
+  if (digits.startsWith('0') && digits.length === 10) return true;
+  if ((digits.startsWith('7') || digits.startsWith('1')) && digits.length === 9) return true;
+  return false;
+}
+
+// Bank account number formats vary a lot by country and bank — this only
+// rules out the obviously-wrong (letters, punctuation, way too short or
+// long), not one specific country's exact format.
+const BANK_ACCOUNT_RE = /^[0-9]{6,20}$/;
+
+function validateSettlementInfo(req, res, next) {
+  const { settlementMethod, settlementAccount } = req.body;
+
+  // Both are optional at onboarding time (an organizer can fill in profile
+  // details before deciding how they'll get paid) — but once either is
+  // given, both are required and both must be well-formed, so a half-filled
+  // or garbage settlement setup never silently reaches the database.
+  if (settlementMethod === undefined && settlementAccount === undefined) {
+    return next();
+  }
+  if (typeof settlementMethod !== 'string' || !SETTLEMENT_METHODS.has(settlementMethod)) {
+    return res.status(400).json({ error: `settlementMethod must be one of: ${[...SETTLEMENT_METHODS].join(', ')}` });
+  }
+  if (typeof settlementAccount !== 'string' || settlementAccount.trim().length === 0) {
+    return res.status(400).json({ error: 'settlementAccount is required when settlementMethod is set' });
+  }
+  if (settlementMethod === 'mpesa' && !isPlausibleKenyanPhone(settlementAccount)) {
+    return res.status(400).json({ error: 'settlementAccount must be a valid Kenyan phone number for M-Pesa (e.g. 0712345678, 254712345678)' });
+  }
+  if (settlementMethod === 'bank' && !BANK_ACCOUNT_RE.test(settlementAccount.replace(/[\s-]/g, ''))) {
+    return res.status(400).json({ error: 'settlementAccount must be a bank account number of 6-20 digits' });
+  }
+  next();
+}
+
 module.exports = {
   generalLimiter,
   authLimiter,
@@ -210,4 +263,5 @@ module.exports = {
   validateEventCreation,
   validateTicketTypeCreation,
   validateSeatGeneration,
+  validateSettlementInfo,
 };

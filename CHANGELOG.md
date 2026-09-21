@@ -2,6 +2,15 @@
 
 All notable changes to the Cloud Run + Cloud SQL variant, in order.
 
+## [1.23.0] — Settlement account format validation
+
+- **`POST /organizer/onboard` now validates `settlementMethod`/`settlementAccount`** instead of accepting anything as free text. This is format/logic validation only — it confirms the value plausibly IS a real settlement account for the stated method, not that the account actually exists or belongs to the organizer; real ownership verification (bank micro-deposits, or a service like Plaid) is deliberately out of scope for this pass.
+- **`settlementMethod` must be one of `mpesa` or `bank`** when either settlement field is provided. Both fields remain optional at onboarding time (an organizer can fill in the rest of their profile before deciding how they'll get paid), but once either is given, both are now required and both must be well-formed — a half-filled or garbage settlement setup can no longer reach the database silently.
+- **`mpesa` accounts must be a plausible Kenyan phone number** — the same shapes `utils/mpesaProvider.js`'s `normalizePhone` already accepts for real STK/B2C calls (`07XXXXXXXX`, `7XXXXXXXX`, `+2547XXXXXXXX`, `2547XXXXXXXX`), checked independently here so the validator doesn't need to import a Daraja-specific module just to test a shape.
+- **`bank` accounts must be 6-20 digits** (spaces and dashes are stripped before checking, so `1234-5678 9012` is accepted and stored as given). Bank account formats vary widely by country and bank, so this only rules out the obviously wrong — letters, punctuation, or a length nothing real uses — rather than enforcing one country's exact format.
+- New `validateSettlementInfo` middleware in `security.js`, wired into `POST /organizer/onboard` only (the one place settlement info is currently set — there's still no route to change it after onboarding, a pre-existing gap this doesn't address).
+- **Verified end-to-end against a real running server and a real local database on both variants**: onboarding with neither settlement field still succeeds (unchanged behavior); an unrecognized `settlementMethod` (e.g. `paypal`) is rejected with `400`; `settlementMethod` given without `settlementAccount` is rejected; a garbage M-Pesa value (`"notaphone"`, `"abc123"`) is rejected while a real-shaped one (`0712345678`, `+254712345678`) succeeds and round-trips correctly through the existing settlement-account encryption/decryption; a non-numeric bank value is rejected while a valid one (including with dashes/spaces) succeeds; confirmed `GET /organizer/me` and other unrelated organizer routes are unaffected.
+
 ## [1.22.0] — Organizer agreement acceptance/recording
 
 - **New versioned organizer-agreement flow**, closing the last open item in the audit's Organizer Onboarding section. `GET /organizer/agreement` reports the current version, what the organizer has accepted (if anything), and whether they're up to date. `POST /organizer/agreement/accept` records acceptance with a timestamp and version, idempotently — accepting an already-current version just returns the existing acceptance rather than re-recording it.
