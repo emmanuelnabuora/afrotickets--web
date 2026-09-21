@@ -7,7 +7,7 @@ const { audit } = require('../utils/audit');
 const { notify } = require('../utils/notify');
 const imageStorage = require('../utils/imageStorage');
 const pii = require('../utils/piiCrypto');
-const { validateEventCreation, validateTicketTypeCreation } = require('../security');
+const { validateEventCreation, validateTicketTypeCreation, validateSeatGeneration } = require('../security');
 
 const router = express.Router();
 
@@ -105,7 +105,7 @@ router.get('/events/mine', requireAuth, requireRole('organizer_owner'), async (r
   res.json({ events });
 });
 
-router.post('/events/:id/seats', requireAuth, requireRole('organizer_owner'), async (req, res) => {
+router.post('/events/:id/seats', requireAuth, requireRole('organizer_owner'), validateSeatGeneration, async (req, res) => {
   const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   const event = await db.one('SELECT * FROM events WHERE id = $1 AND organizer_id = $2', [req.params.id, organizer?.id]);
   if (!event) return res.status(404).json({ error: 'Event not found' });
@@ -114,9 +114,6 @@ router.post('/events/:id/seats', requireAuth, requireRole('organizer_owner'), as
   const { ticketTypeId, sectionName, tier, rows, seatsPerRow } = req.body;
   const ticketType = await db.one('SELECT * FROM ticket_types WHERE id = $1 AND event_id = $2', [ticketTypeId, event.id]);
   if (!ticketType) return res.status(404).json({ error: 'Ticket type not found on this event' });
-  if (!sectionName || !rows || !seatsPerRow) {
-    return res.status(400).json({ error: 'sectionName, rows, and seatsPerRow are required' });
-  }
   const seatCount = rows * seatsPerRow;
   if (seatCount > ticketType.quantity_total) {
     return res.status(400).json({ error: `${seatCount} seats exceeds this ticket type's quantity_total of ${ticketType.quantity_total}` });

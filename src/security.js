@@ -165,6 +165,39 @@ function validateTicketTypeCreation(req, res, next) {
   next();
 }
 
+// Seat generation (organizers.js's POST /events/:id/seats) was previously
+// unvalidated: rows/seatsPerRow only got checked against quantity_total
+// AFTER multiplying them together, so a non-numeric, negative, zero, or
+// fractional value could sail through — e.g. rows="abc" makes seatCount
+// NaN, which is neither `> quantity_total` (NaN comparisons are always
+// false) nor produces any loop iterations, so the route returned
+// `201 Generated NaN seats` while silently creating zero rows. Negative
+// values had the same silent-no-op failure mode. This closes that off by
+// requiring both to be sane, bounded whole numbers before any arithmetic
+// or DB work happens. The 1-1000 bounds on each factor keep the largest
+// possible seatCount (1,000,000) in line with the existing ticket-type
+// quantity cap above, so this can't be used to force a runaway insert loop
+// even when quantity_total itself is large.
+const SECTION_NAME_RE = /^[a-zA-Z0-9 &/'().-]{1,100}$/;
+const TIER_RE = /^[a-zA-Z0-9 &/'-]{1,40}$/;
+
+function validateSeatGeneration(req, res, next) {
+  const { sectionName, tier, rows, seatsPerRow } = req.body;
+  if (typeof sectionName !== 'string' || !SECTION_NAME_RE.test(sectionName)) {
+    return res.status(400).json({ error: "sectionName must be 1-100 characters (letters, numbers, spaces, &/-'().)" });
+  }
+  if (tier !== undefined && tier !== null && (typeof tier !== 'string' || !TIER_RE.test(tier))) {
+    return res.status(400).json({ error: "tier must be 1-40 characters (letters, numbers, spaces, &/-')" });
+  }
+  if (!Number.isInteger(rows) || rows < 1 || rows > 1000) {
+    return res.status(400).json({ error: 'rows must be a whole number between 1 and 1,000' });
+  }
+  if (!Number.isInteger(seatsPerRow) || seatsPerRow < 1 || seatsPerRow > 1000) {
+    return res.status(400).json({ error: 'seatsPerRow must be a whole number between 1 and 1,000' });
+  }
+  next();
+}
+
 module.exports = {
   generalLimiter,
   authLimiter,
@@ -176,4 +209,5 @@ module.exports = {
   validateRegistration,
   validateEventCreation,
   validateTicketTypeCreation,
+  validateSeatGeneration,
 };
