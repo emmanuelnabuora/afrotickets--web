@@ -11,6 +11,18 @@ const pool = new Pool({
   ssl: process.env.PGSSL === 'require' ? { rejectUnauthorized: false } : false,
 });
 
+// Without this handler, an error on an IDLE pooled connection — Cloud SQL
+// terminating it during maintenance, a network blip, the instance
+// restarting — is an unhandled 'error' event, which crashes the entire
+// Node process (discovered while testing /health's new DB check below: an
+// otherwise-transient Postgres hiccup turned into a full outage requiring a
+// Cloud Run cold restart). This only fires for a connection sitting idle in
+// the pool, never for one actively running a query — that failure still
+// surfaces normally as a rejected promise to whichever request triggered it.
+pool.on('error', (err) => {
+  console.error('[db] idle client error (connection recycled, process continues):', err.message);
+});
+
 async function query(sql, params = []) {
   const result = await pool.query(sql, params);
   return result.rows;

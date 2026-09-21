@@ -67,7 +67,22 @@ const { version: APP_VERSION } = require('../package.json');
 // hitting the wrong URL (e.g. prod when you meant staging) is obvious from
 // the response itself, not just inferred from which hostname you typed.
 const APP_ENV = process.env.APP_ENV || 'production';
-app.get('/health', (req, res) => res.json({ ok: true, service: 'afrotickets-api', version: APP_VERSION, env: APP_ENV }));
+// A real database ping, not just "the process is up" — the previous version
+// of this endpoint returned ok:true unconditionally, so a Cloud Monitoring
+// uptime check watching it could never detect a dead Cloud SQL connection
+// (network blip, instance restart, exhausted connection pool). This is the
+// endpoint that uptime checks and alerting are configured against — see
+// backups-monitoring-alerting-v1.19.0.md for the actual Cloud Monitoring
+// setup this enables.
+app.get('/health', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ ok: true, service: 'afrotickets-api', version: APP_VERSION, env: APP_ENV, db: 'ok' });
+  } catch (err) {
+    console.error('[health] database check failed:', err.message);
+    res.status(503).json({ ok: false, service: 'afrotickets-api', version: APP_VERSION, env: APP_ENV, db: 'down' });
+  }
+});
 app.get('/version', (req, res) => res.json({ version: APP_VERSION, db: 'postgres', env: APP_ENV }));
 // Public, non-secret config the frontend needs to initialize client-side SDKs.
 // The Stripe *publishable* key is safe to expose — it's designed to be
