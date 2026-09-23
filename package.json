@@ -1,6 +1,6 @@
 {
   "name": "afrotickets-backend-gcp",
-  "version": "1.25.0",
+  "version": "1.26.0",
   "description": "AfroTickets backend (Cloud Run + Cloud SQL variant) — auth, ticket inventory, checkout, payments, QR tickets, check-in, admin, resale, seat maps, AfroGuide, saved events, notifications.",
   "main": "src/index.js",
   "scripts": {

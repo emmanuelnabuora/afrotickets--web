@@ -9,6 +9,7 @@ const imageStorage = require('../utils/imageStorage');
 const documentStorage = require('../utils/organizerDocumentStorage');
 const pii = require('../utils/piiCrypto');
 const { validateEventCreation, validateTicketTypeCreation, validateSeatGeneration, validateSettlementInfo } = require('../security');
+const { AGREEMENT_VERSION, AGREEMENT_TEXT } = require('../legal/organizerAgreement');
 
 const router = express.Router();
 
@@ -47,11 +48,13 @@ function blockIfSuspended(organizer, res) {
   return false;
 }
 
-// Bump this to force every organizer to re-accept — e.g. after a real terms
-// change — with no migration needed. An organizer whose agreement_version
-// doesn't match this exactly hasn't accepted the CURRENT terms, whether
-// they've never accepted anything or accepted an older version.
-const CURRENT_AGREEMENT_VERSION = '2026-09-v1';
+// The version and text now live in src/legal/organizerAgreement.js (v1.26.0)
+// rather than a placeholder string here. Bumping AGREEMENT_VERSION there
+// forces every organizer to re-accept — e.g. after a real terms change —
+// with no migration needed. An organizer whose agreement_version doesn't
+// match this exactly hasn't accepted the CURRENT terms, whether they've
+// never accepted anything or accepted an older version.
+const CURRENT_AGREEMENT_VERSION = AGREEMENT_VERSION;
 
 // Same enforcement shape and same call sites as blockIfSuspended — creating
 // or editing an event, generating seats, changing an event's image are all
@@ -74,6 +77,7 @@ router.get('/agreement', requireAuth, requireRole('organizer_owner'), async (req
   const organizer = await getOwnedOrganizerOrFail(req.user.sub);
   res.json({
     currentVersion: CURRENT_AGREEMENT_VERSION,
+    text: AGREEMENT_TEXT,
     acceptedVersion: organizer?.agreement_version || null,
     acceptedAt: organizer?.agreement_accepted_at || null,
     accepted: organizer?.agreement_version === CURRENT_AGREEMENT_VERSION,

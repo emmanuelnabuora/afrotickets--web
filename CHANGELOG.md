@@ -2,6 +2,14 @@
 
 All notable changes to the Cloud Run + Cloud SQL variant, in order.
 
+## [1.26.0] — Real organizer agreement text wired in
+
+- **New `src/legal/organizerAgreement.js`** holds the actual organizer agreement text (14 sections: eligibility, listings, fees/tax, payments/payouts, refunds, resale, content/data, prohibited conduct, suspension/termination, disclaimers, liability, changes, governing law, misc) instead of nothing — closes the go-live gate flagged in the production-readiness audit ("the acceptance mechanism exists, there's no real document behind it").
+- **`GET /organizer/agreement` now returns the actual `text`** alongside `currentVersion`/`accepted`/etc., not just version metadata.
+- **`CURRENT_AGREEMENT_VERSION` bumped from the placeholder `2026-09-v1` to `2026-09-v2`**, sourced from the new module's `AGREEMENT_VERSION` export — this forces every organizer (including any who already accepted the old placeholder) to accept the real document before they can create/edit events, generate seats, or change event imagery again. No migration needed; this is exactly what the versioned-acceptance mechanism (shipped v1.22.0) was built for.
+- **This is a first draft, not attorney-reviewed.** The numeric terms (8% platform fee, 2% tax, 10% resale fee, 10% payout reserve held 14 days) are pulled directly from the running code and are accurate. Several sections still contain bracketed `[ALL CAPS]` placeholders for terms that need a legal/business decision (company legal name/entity/jurisdiction, governing law and dispute resolution, liability caps, refund eligibility policy specifics, tax/merchant-of-record position, notice mechanism, and a reference to a privacy policy that doesn't exist yet). Do not treat this as ready to bind a real organizer — see `src/legal/organizerAgreement.js`'s header comment and the project doc for the full list of what still needs sign-off.
+- **Tested end-to-end against a real running server on both variants**: registered a fresh organizer, confirmed `GET /organizer/agreement` returns `currentVersion: "2026-09-v2"` and the real text, confirmed `POST /organizer/events` is blocked with a 403 agreement-not-accepted error before acceptance, called `POST /organizer/agreement/accept`, and confirmed event creation then succeeds (201).
+
 ## [1.25.0] — PII backfill script for pre-v1.13.0 rows
 
 - **New `backfillPii.js`** (run via `npm run backfill:pii`), closing the "migration note" flagged as a known gap when PII encryption shipped in v1.13.0: `users.phone` and `organizers.settlement_account` rows written before that release (or written while the deployment was still running on the dev-fallback key) are still plaintext, and `decrypt()` was deliberately built to tolerate that rather than throw — but nothing ever went back and actually encrypted them. This is that one-time backfill.
