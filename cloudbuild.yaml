@@ -16,7 +16,7 @@ steps:
       - 'push'
       - 'us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/afrotickets-api:$SHORT_SHA'
 
-  - name: 'gcr.io/google-cloud-sdk/cloud-sdk:slim'
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
     entrypoint: gcloud
     args:
       - 'run'
